@@ -1,0 +1,154 @@
+# Accumulated Key Takeaways (Days 1-6)
+ 
+## Window functions
+- dense_rank vs rank vs row_number: dense (1,2,2,3) / rank (1,2,2,4) /
+  row_number (unique, ties broken arbitrarily). Top-N with ties needs
+  dense_rank; gaps-and-islands needs row_number's strict +1.
+- dense_rank()/rank()/row_number() take NO arguments — ordering comes
+  entirely from the window's orderBy. F.dense_rank(F.col(...)) is a
+  TypeError.
+- A window without partitionBy forces all data into one partition —
+  performance killer on large tables; a standing review-checklist item.
+## Gaps-and-islands
+- (value - row_number) is constant within an island; for dates use
+  DATE_SUB(d, rn) as the anchor/island key.
+- Dedupe BEFORE numbering: a duplicate shifts rn and silently splits
+  a streak — passes on clean data, fails on dirty data.
+## Deduplication (4 equivalent-ish forms)
+- SELECT DISTINCT A,B ≡ GROUP BY A,B (no aggregates) ≡
+  select(A,B).distinct() — identical physical plan (Aggregate);
+  one shuffle.
+- dropDuplicates(["A","B"]) keeps ALL columns; which row survives per
+  key is NONDETERMINISTIC.
+- Window row_number()=1 keeps all columns AND deterministically picks
+  the row (ORDER BY tie-breaker) — required for "keep latest per key".
+- Choose: keys only -> DISTINCT/GROUP BY; need other columns, any row
+  -> dropDuplicates; need other columns, specific row -> window.
+## Pivot
+- pivot(col) without a values list triggers an EXTRA job (distinct +
+  collect to driver) and makes the output schema data-dependent
+  (schema drift). Always pass the list when the domain is known.
+- The values list is also a FILTER: values not listed are silently
+  dropped.
+- Pivot cells with no data are NULL, not 0 — na.fill / COALESCE
+  explicitly.
+- Single aggregation: alias does NOT affect column names (pure values).
+  Multiple aggregations: columns become <value>_<agg_alias>; count =
+  |values| x |aggs|.
+- In pivot's aggregation context F.count("*") fails to resolve
+  (INVALID_USAGE_OF_STAR_OR_REGEX). Use F.count(F.lit(1)) in DSL
+  everywhere; COUNT(*) in SQL is fine everywhere.
+- Conditional aggregation SUM(CASE WHEN...) is the portable equivalent;
+  nearly identical plan once the pivot list is explicit.
+## Arrays
+- explode() DROPS rows with empty/NULL arrays; explode_outer() keeps
+  them (item = NULL). The #1 array-column bug.
+- No-explode route: collect_list(arrays) -> flatten -> array_distinct /
+  array_sort / size does group-level array math without row explosion.
+- collect_set dedupes at map-side partial aggregation (smaller shuffle);
+  collect_list preserves duplicates. Element order of collect_set is
+  nondeterministic — array_sort before comparing.
+- sort_array vs array_sort: both ascending by default; differ in NULL
+  placement (first vs last) and extras (bool desc flag vs lambda
+  comparator, 3.0+).
+- SIZE(NULL) = -1 (legacy quirk) — COALESCE-guard nullable arrays.
+## NULL semantics of aggregates
+- ALL aggregate functions (count/sum/avg/collect_list/collect_set...)
+  ignore NULL inputs. This one rule kills two review categories:
+  missing-NULL-handling bugs AND redundant defensive code
+  (filter(isNotNull) before collect_set, coalesce after na.fill).
+- COUNT(column) counts non-NULL only; returns 0 (never NULL) for
+  all-NULL groups. Footgun in one context (silent undercount), the
+  right tool in another (zeroing empty-array customers after
+  explode_outer).
+- CASE WHEN ... ELSE 0 vs no-ELSE + COALESCE: both valid NULL
+  strategies but must be paired consistently.
+## Joins
+- on="key" (string) merges the join key into ONE column; for left
+  joins the merged key takes the LEFT side's value (orphan keys
+  survive). Expression joins (a.k == b.k) keep BOTH columns ->
+  AMBIGUOUS_REFERENCE risk; disambiguate via df["col"], alias
+  qualification, or drop one side immediately.
+- Self-joins REQUIRE aliases; even F.col is ambiguous there.
+- LEFT join + COALESCE(dim_col, 'UNKNOWN') = standard pattern so
+  unmatched fact rows survive enrichment; inner join silently loses
+  revenue.
+- Broadcast: F.broadcast(dim) / /*+ BROADCAST(alias) */ wraps the
+  SMALL side. Three-tier mechanism: explicit hint (unconditional) >
+  static autoBroadcastJoinThreshold (needs size STATISTICS — missing
+  stats e.g. Scan ExistingRDD are treated as infinitely large, so no
+  auto-broadcast) > AQE runtime conversion (real sizes at shuffle
+  boundaries, but initial shuffles already paid). Cost order:
+  explicit < AQE conversion < full SortMergeJoin.
+- Single-block GROUP BY with transformed keys: repeat the EXACT
+  expression in GROUP BY, or lift the transform into a CTE/subquery
+  (cleanest — one copy, no drift). GROUP BY alias resolves input
+  columns FIRST (silent rebinding) and is non-portable.
+## Maps
+- map_keys / map_values / map_entries ~= dict.keys()/.values()/.items();
+  all return ARRAY columns, so downstream work uses the array-function
+  family (size, flatten, array_distinct...).
+- map_keys(NULL) / map_values(NULL) return NULL, NOT an empty array.
+  NULL map vs empty map is a real distinction that ripples downstream.
+- Map access (props['k'], .getItem, element_at) returns NULL for both
+  a missing key and a NULL map — never errors. Safe in filters
+  (aggregate-NULL rule absorbs it), silent when debugging.
+- explode() on a map emits TWO columns (key, value); explode on
+  map_keys(...) emits one. Same drop-rule as arrays (Day 4):
+  explode drops NULL/empty maps, explode_outer keeps the row.
+- Dedup unit must match the row grain: at exploded grain keys are
+  scalar elements, so collect_set(key) dedupes keys directly; at
+  un-exploded grain each element is a whole ARRAY, so collect_set
+  dedupes arrays ([] counts as a member!) — must
+  flatten -> array_distinct instead. Companion rule to "explode
+  changes grain, re-examine every COUNT" (count -> countDistinct(id)).
+- countDistinct is pricier than count (expand/two-phase aggregation,
+  weaker map-side partial agg) — the hidden cost of the explode route;
+  verify via explain(), not memory.
+## Physical plans / explain()
+- Read bottom-up; key nodes: Scan (source + stats quality), Exchange
+  (= one shuffle each, the cost driver), join node (strategy +
+  BuildLeft/Right side), HashAggregate pairs (partial/final =
+  map-side pre-aggregation working).
+- AdaptiveSparkPlan isFinalPlan=false means pre-execution static plan;
+  trigger an action on the SAME DataFrame object, then explain() again
+  for the AQE final plan (Initial vs Final diff = AQE's runtime
+  decisions: join conversion, AQEShuffleRead coalesced partitions).
+- Optimizer inserts operators you didn't write (isnotnull filter on
+  the null-rejecting side of joins, column-pruning Projects).
+- Shuffle-producing ops: groupBy/distinct/dropDuplicates (with partial
+  agg relief), non-broadcast joins (both sides), Window.partitionBy,
+  orderBy, repartition, intersect/except. Narrow (no shuffle):
+  select/filter/withColumn/explode/union/coalesce(shrink).
+- Same partitioning can be reused (ENSURE_REQUIREMENTS) only when the
+  partition expressions MATCH; subset/superset keys still re-shuffle.
+## API style conventions
+- Pure column references (select/groupBy/on) -> plain strings; F.col()
+  when the column participates in expressions (comparison, arithmetic,
+  .desc()/.alias()/.cast(), when()), when referencing a column created
+  mid-chain, alias-qualified names ("t.col"), or programmatic column
+  generation. df["col"] (bound) for self-join disambiguation.
+- DATE_SUB(date, int_col) over date - int (portability: MySQL/Hive
+  differ); F.date_sub accepts Column only on Spark 3.3+.
+- try_cast only for genuinely dirty data; plain cast states intent.
+- cast("int") after count/sum: schema hygiene for production sinks
+  (count returns BIGINT); tests won't catch it either way.
+- LATERAL VIEW OUTER EXPLODE (Hive style, max compatibility) vs
+  modern LATERAL explode_outer(...) — both fine in Spark 3.x.
+## Review heuristics (accumulated)
+- In unusual contexts (pivot agg, custom agg), distrust star/wildcard
+  expressions — resolution paths differ.
+- The aggregate-NULL rule prunes defensive code in BOTH directions.
+- When explain() contradicts expectations, check the Scan node type
+  first — statistics availability explains half of optimizer behavior.
+- Column-order of output matters to positional tests; a select that
+  reorders is a silent contract change for downstream consumers.
+- Verify performance claims by counting Exchange nodes, not from
+  memory.
+- Coincidentally-correct output is camouflage: a wrong-level dedup can
+  produce the right number on some groups (user 1's three distinct
+  key-arrays = three distinct keys). Verify the MECHANISM per edge-case
+  row, not just the final numbers.
+- Misleading column names survive tests but not code review: a column
+  holding all property keys named "devices" is a contract lie to
+  downstream readers.
