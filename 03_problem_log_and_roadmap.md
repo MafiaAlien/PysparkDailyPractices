@@ -13,6 +13,7 @@
 | 8 | Deduplication: keep latest per key (window rn=1 vs struct-argmax vs COUNT OVER) | Medium-Hard | Current product catalog from multi-feed updates: surviving row + n_versions | exact-duplicate replay must still count in n_versions; ordered window default frame turns count over into a RUNNING count (count window must have NO orderBy); dropDuplicates after orderBy is not a contract; same-partitionBy windows share ONE shuffle vs separate groupBy branch costing a second Exchange + second scan |
 | 9 | Semi / anti joins as filter idioms (left_semi / left_anti, EXISTS / NOT EXISTS, IN / NOT IN) | Easy-Medium | Clean outreach list: customers with >=1 order AND zero complaints | NOT IN + nullable subquery column returns ZERO rows (three-valued logic); inner-join-as-existence-test multiplies rows (customer with 3 orders -> 3 rows) needing dedup; anonymous complaint (cust_id NULL) is the trap seed |
 | 10 | Complex aggregation: GROUPING SETS / ROLLUP / CUBE, multi-grain one-pass | Medium | Four-grain sales summary (region+category / region / category / grand_total) in one pass, rolled-up dims -> 'ALL' | genuinely-NULL source region indistinguishable from the subtotal NULL cube injects once projected; must stay a distinct group and not collapse into 'ALL'. Two robust routes: pre-fill sentinel (coalesce BEFORE cube, kills source NULL so only cube-NULL remains) vs post-hoc discriminate (keep NULL, branch GROUPING()==1 -> 'ALL' BEFORE IS NULL -> sentinel; order-sensitive). rollup would MISS the (category) grain — needs cube or grouping sets |
+| 11 | Date/time deep dive: UTC->local-tz bucketing + date-dimension spine gap-fill | Medium-Hard | Dense daily report per store over a 7-day window: revenue + n_txn bucketed by store LOCAL date, zero-filled on no-sale days | conversion DIRECTION (from_utc_timestamp, NOT to_utc_timestamp) is the whole trap — silent day-shift on rows straddling local midnight, PASSES on non-straddling rows; window filter must be applied on the LOCAL date AFTER tz conversion, never on the raw UTC date (an out-of-window UTC sale can land in-window locally, and vice versa); to_date depends on session tz -> pin it to avoid double-shift; gap-fill via explode(sequence) date axis crossJoin stores -> LEFT join sparse agg -> COALESCE 0 (dimension-table cousin of Day 2 gaps-and-islands) |
 
 ## Supplemental drills completed
 - Pivot mini-drills x5 (script form, no class): explicit values list,
@@ -20,15 +21,15 @@
   naming, pivot -> unpivot round trip (stack / unpivot).
 
 ## Scheduled next (planned cadence, Medium / Medium-Hard)
-- Day 11 — Date/time deep dive: timezones, timestamp truncation, date-
-  dimension join, range gap-filling. Medium-Hard. Spaced one day off
-  Day 10 to alternate topics. Trap candidate: cross-timezone date_trunc /
-  session-window boundary, OR date-dim left join to fill missing dates
-  (dimension-table version of Day 2 gaps-and-islands).
-- Day 12 — Complex aggregation, advanced: multi-grain + conditional
-  aggregation mixed, OR cube's combinatorial blow-up vs GROUPING SETS'
-  precise control trade-off (echoes Day 3 pivot's "explicit values list"
-  philosophy). Medium-Hard.
+- Day 12 — Complex aggregation, advanced (NEXT IN QUEUE): multi-grain +
+  conditional aggregation mixed, OR cube's combinatorial blow-up vs
+  GROUPING SETS' precise control trade-off (echoes Day 3 pivot's
+  "explicit values list" philosophy). Medium-Hard. Alternates off the
+  Day 11 date/time topic.
+- Day 13 — Date/time round 2 candidate: session-window / event-sessionization
+  (session_window or lag-based gap threshold), OR DST-crossing tz math
+  (Day 11 used a no-DST window on purpose — round 2 puts the clock change
+  INSIDE the window so a local day has 23/25 hours). Medium-Hard.
 
 Cadence principle: alternate the two topics, step difficulty upward, each
 problem echoes >=1 logged takeaway.
@@ -39,7 +40,9 @@ problem echoes >=1 logged takeaway.
 - UDFs: python UDF vs pandas_udf, when to avoid, cost model
 - Unpivot / melt as the primary topic (only touched in drills)
 - Date/time deep dive: timezones, timestamps, truncation, ranges,
-  calendar join against a date dimension   <- scheduled Day 11
+  calendar join against a date dimension   <- Day 11 DONE (UTC->local
+  bucketing + date-dim spine gap-fill); DST-crossing / sessionization
+  variant still open (Day 13 candidate)
 - Null semantics special: null-safe equality (<=>), null in joins,
   null ordering in windows
 - Incremental patterns: SCD2-style merge logic in PySpark

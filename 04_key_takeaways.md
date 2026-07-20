@@ -1,4 +1,4 @@
-# Accumulated Key Takeaways (Days 1-10)
+# Accumulated Key Takeaways (Days 1-11)
 
 ## Window functions
 - dense_rank vs rank vs row_number: dense (1,2,2,3) / rank (1,2,2,4) /
@@ -323,6 +323,43 @@
 - cast('long') on SUM(int): SUM(int)->bigint; explicit cast is schema
   hygiene for production sinks (check() won't catch either way).
 
+## Date/time: tz bucketing + date-dimension gap-fill (Day 11)
+- Conversion DIRECTION is the whole trap. from_utc_timestamp(ts, tz)
+  reads "ts is a UTC instant, give me the wall-clock time in tz" — the
+  correct direction for "stored in UTC, report in local". to_utc_timestamp
+  is the INVERSE (local->UTC) and shifts the wrong way: an LA sale gets
+  +8h instead of -8h, silently moving it to the next day. The bug PASSES
+  on every row that doesn't straddle local midnight — only day-boundary
+  rows expose it. Same "camouflage on clean rows" family as COUNT(device.os).
+- to_date / cast(date) on a timestamp is evaluated in
+  spark.sql.session.timeZone. You already localized via
+  from_utc_timestamp; if the session tz is non-UTC, to_date re-shifts a
+  SECOND time = double-conversion day-shift. Pin session tz (UTC in the
+  harness) so the date you computed isn't silently re-bucketed.
+- The window filter must be applied on the LOCAL date, AFTER tz
+  conversion — never on the raw UTC date. An out-of-window UTC timestamp
+  can land in-window locally (and vice versa), so filtering ts_utc first
+  drops/keeps the wrong rows. This is the SECOND layer of the tz trap,
+  distinct from the direction bug: right function, wrong axis to filter on.
+- Gap-fill = manufacture a dense SPINE, don't detect gaps. Build the full
+  key x date axis (explode(sequence(start, stop, interval 1 day)) crossJoin
+  the dimension), LEFT join the sparse aggregate onto the spine (spine is
+  the LEFT/preserved side), COALESCE nulls to 0. Dimension-table cousin of
+  Day 2 gaps-and-islands: Day 2 DETECTED gaps via row_number arithmetic;
+  here you build the complete axis so a missing day cannot hide.
+- sequence(start, stop, interval) is INCLUSIVE on BOTH ends; explode turns
+  the array into rows. Narrow generation (no shuffle). Aggregate sales to
+  (store, day) grain BEFORE joining the spine: the join is then
+  spine(small) LEFT agg(small) — never join raw sales to the spine (grain
+  blow-up + needless shuffle), same "aggregate before the wide join"
+  discipline as Day 8's groupBy-branch cost.
+- Zero-fill both measures with correct types: revenue -> 0.0 (double,
+  SUM(double) already double), n_txn -> CAST(0 AS BIGINT) to match COUNT's
+  bigint. The double cast on revenue is redundant (int literal 0 promotes
+  to double under coalesce with a double); the bigint cast on n_txn is the
+  one that actually earns its keep. Redundant-vs-necessary defensive cast,
+  same discriminate-don't-blanket-cast rule as elsewhere.
+
 ## Physical plans / explain()
 - Read bottom-up; key nodes: Scan (source + stats quality), Exchange
   (= one shuffle each, the cost driver), join node (strategy +
@@ -408,3 +445,21 @@
   Either pre-fill a sentinel before the aggregation (root fix) or gate
   every dim reconstruction on GROUPING()==1 first — never rebuild a dim
   from `IS NULL` alone in a grouping-sets result.
+- HAVING that is secretly a WHERE (Day 11): filtering on a GROUP BY key
+  in HAVING happens to equal WHERE only because the predicate touches a
+  group key, not an aggregate. It PASSES but is a smell — it relies on
+  "the filter column is a grouping key" and forfeits predicate pushdown
+  to before the aggregate. Row-level predicates belong in WHERE; reserve
+  HAVING for conditions on aggregate results. Catch it by reading: ask
+  "is this predicate over a raw column or an aggregate?" — raw column in
+  HAVING = should be WHERE.
+- spark.range vs explode(sequence) for a small fixed axis is NOT a
+  cheap/expensive story (Day 11 corrected a misconception). Neither is a
+  shuffle; range is narrow too. The real difference: sequence is a
+  compile-time constant array (matches the intent of a known date domain,
+  and its crossJoin reliably degrades to a broadcast/nested-loop with ~0
+  Exchange), while range yields a partitioned dataset that MAY introduce
+  a tiny extra exchange at the crossJoin. On a 7-row axis both are
+  effectively free. Argue it as "constant-domain intent + broadcast
+  stability", verified by counting Exchange in .explain() — never as a
+  memorized "range is expensive".
