@@ -166,8 +166,8 @@ class Solution:
         return spark.sql(sql)
     
 def ai_solve_dsl(df: DataFrame) -> DataFrame:
-    grouped = df.groupBy(
-        F.grouping_sets(
+    grouped = (
+        df.groupingSets(
             [["region", "category"], ["region"], ["category"]],
             "region", "category"
         )
