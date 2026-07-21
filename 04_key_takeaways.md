@@ -1,4 +1,4 @@
-# Accumulated Key Takeaways (Days 1-11)
+# Accumulated Key Takeaways (Days 1-12)
 
 ## Window functions
 - dense_rank vs rank vs row_number: dense (1,2,2,3) / rank (1,2,2,4) /
@@ -323,6 +323,49 @@
 - cast('long') on SUM(int): SUM(int)->bigint; explicit cast is schema
   hygiene for production sinks (check() won't catch either way).
 
+## Precise-grain control + conditional count (Day 12)
+- Grain-set selection = pick the RIGHT tool for the EXACT set of grains,
+  not the most powerful one. Wanted {(r,c),(r),(c)} (three non-empty
+  grains, NO grand total):
+  * GROUPING SETS ((r,c),(r),(c)) — names exactly those three, emits no
+    () row, needs no post-filter. The precise-control winner (same
+    "explicit values list" philosophy as Day 3 pivot).
+  * CUBE(r,c) — emits all four incl. grand total (); must filter gid!=3.
+    Over-produces then prunes.
+  * ROLLUP(r,c) — {(r,c),(r),()}: WRONG set — has the () you don't want
+    AND misses (category). Hierarchical assumption r->c doesn't fit a
+    symmetric two-singleton requirement.
+  * DSL has NO grouping_sets: use cube-then-filter (one Expand, one
+    Exchange, computes a 4th grain it throws away) or explicit 3-branch
+    union (3 scans + 3 Exchanges, no wasted grain). On tiny domains
+    either is fine; at scale prefer single-scan grouping sets / cube.
+- Threshold / conditional count trap (the planted trap): big_orders =
+  "# rows with amount>=1000". The else-branch value decides everything:
+  * SUM(when(cond,1).otherwise(0))  -> correct (sums the 1s)
+  * COUNT(when(cond,1))  [NO otherwise] -> correct (else = NULL, COUNT
+    skips NULL)
+  * COUNT(when(cond,1).otherwise(0)) -> WRONG: 0 is non-NULL, COUNT
+    counts EVERY row = group SIZE. Right on a grain where all rows
+    happen to qualify, wrong elsewhere -> coincidentally-correct
+    camouflage (same aggregate-NULL family as COUNT(device.os) Day 7).
+- Rebuild rolled-up dims from grouping metadata ALONE, never `col IS NULL
+  AND gid=k`. The IS NULL conjunct is redundant on clean data and
+  actively misleading: it signals "NULL is part of the判据" when gid
+  (or grouping(col)=1) is the sole root signal. On a genuinely-NULL
+  source dim the IS NULL version can still resolve correctly by luck,
+  but it's a deletable-invariant smell — strip IS NULL, keep gid only.
+- grouping(col) -> 0/1 per row (1 = this col rolled up here). It IS an
+  aggregate, valid only under group by / grouping sets / cube / rollup.
+  grouping_id(c1,...,cn) packs those bits into one int, LEFTMOST arg =
+  HIGH bit: grouping_id(region,category) = grouping(region)*2 +
+  grouping(category)*1. So gid=1 -> (region) grain (category rolled up,
+  fill category='ALL'); gid=2 -> (category) grain (region rolled up,
+  fill region='ALL'). NOTE the cross: the column filled 'ALL' is the
+  ROLLED-UP dim, the level/grain name is the SURVIVING dim — they are
+  opposite by construction (the reason level comments are easy to write
+  backwards). grouping(col)=1 form is self-documenting; grouping_id
+  magic numbers need bit-order recall pinned to ARG order.
+
 ## Date/time: tz bucketing + date-dimension gap-fill (Day 11)
 - Conversion DIRECTION is the whole trap. from_utc_timestamp(ts, tz)
   reads "ts is a UTC instant, give me the wall-clock time in tz" — the
@@ -463,3 +506,21 @@
   effectively free. Argue it as "constant-domain intent + broadcast
   stability", verified by counting Exchange in .explain() — never as a
   memorized "range is expensive".
+- API hallucination — the plausible-but-nonexistent DSL function (Day 12):
+  the AI wrote F.grouping_sets([...], "region", "category") in DSL. It
+  does NOT exist — not in 3.x, not even in Spark 4.2 (AttributeError at
+  runtime, whole job dies). The name is dangerous precisely because it
+  mirrors the real SQL `GROUP BY GROUPING SETS` clause, so it reads as
+  obviously-correct. Real DSL has df.cube / df.rollup + F.grouping /
+  F.grouping_id, but NO grouping_sets helper. Review heuristic: for any
+  F.* / df.* call you haven't personally used, "the name matches a SQL
+  keyword" is NOT evidence it exists as a Python API — verify (dir(F),
+  docs, a scratch run) before trusting. Symmetry with SQL is a lure, not
+  a guarantee.
+- IS NULL riding along with a grouping bit (Day 12): `WHEN col IS NULL
+  AND gid=k THEN 'ALL'` passes on clean data but is a smell — gid (or
+  grouping(col)=1) is the SOLE root判据; the IS NULL conjunct is
+  redundant and tells the next editor NULL is part of the decision. Strip
+  it to `WHEN gid=k` (or `WHEN grouping(col)=1`). Companion to the Day 10
+  "never rebuild a dim from IS NULL alone" — here the failure mode is the
+  opposite direction (IS NULL present but superfluous), same fix: gid only.
