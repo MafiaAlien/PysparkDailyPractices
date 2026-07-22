@@ -1,4 +1,4 @@
-# Accumulated Key Takeaways (Days 1-12)
+# Accumulated Key Takeaways (Days 1-13)
 
 ## Window functions
 - dense_rank vs rank vs row_number: dense (1,2,2,3) / rank (1,2,2,4) /
@@ -403,6 +403,93 @@
   one that actually earns its keep. Redundant-vs-necessary defensive cast,
   same discriminate-don't-blanket-cast rule as elsewhere.
 
+## Sessionization & window frames (Day 13)
+- Gap-threshold sessionization = gaps-and-islands with a THRESHOLD
+  instead of strict +1. Day 2's (value - row_number) constant-diff
+  trick DIES here (gap is any value 0..threshold, not a fixed step).
+  General idiom, three moves: lag(prev ts) -> boundary flag
+  (prev IS NULL OR gap > threshold -> 1 else 0) -> running SUM(flag)
+  over ordered window = the island/session key -> groupBy(user, key).
+- The ordered-window default frame (RANGE UNBOUNDED PRECEDING ..
+  CURRENT ROW) that was the Day 8 BUG (accidental running count) is
+  the TOOL here (deliberate running sum of flags). Same mechanism,
+  opposite verdict — judge the frame against INTENT, not by reflex.
+- Threshold direction & unit traps (all coincidentally-correct on
+  clean data, same family as Day 11 tz-direction / Day 7 COUNT):
+  * gap must be current - prev; prev - current is always negative,
+    `> threshold` never fires -> everything collapses to one session.
+  * compare in SECONDS (gap_sec > 1800), NOT truncated minutes.
+    timestamp_diff('MINUTE',...) / int-minute rounding truncates
+    30:40 -> 30, passes `> 30` as false = wrongly merged. Integer-
+    minute boundaries pass on test data, sub-minute gaps expose it.
+  * boundary is STRICTLY greater: gap == 1800s stays SAME session
+    (spec: <= 30 min same). `>= 1800` is off-by-one on the exact-
+    boundary row.
+- Debug discipline for window pipelines: when the running sum looks
+  wrong, .show() the INTERMEDIATE flag column first. A flag column
+  that's all 0 (e.g. when(...).otherwise(0) with BOTH branches 0) is
+  visible in one glance — don't suspect sum-over; it faithfully adds
+  a broken input.
+- session_window built-in vs a lag-written spec: session_window closes
+  at last_ts + gap and merges only if new_ts < that end (STRICT <), and
+  its .end = last event + gap (not the last event's ts). Two contract
+  mismatches with a "gap <= 30 same session, end = last event" spec:
+  the exact-boundary row splits, and every end is shifted +gap. Built-ins
+  carry their OWN contract — match it to the written spec before reaching
+  for them (right tool when the spec IS written in session_window terms,
+  esp. streaming).
+
+## Window frame mechanics: ROWS vs RANGE, frame-affected vs not
+- Frame is part of the WINDOW SPEC, built on Window/WindowSpec BEFORE
+  .over(): Window.partitionBy(...).orderBy(...).rowsBetween(a,b), THEN
+  fn.over(w). .over() returns a Column and is the CLOSING step —
+  col.over().rowsBetween(...) is AttributeError (Column has no frame
+  method). Frame lives on the window, not the aggregate result. Build
+  order: partitionBy -> orderBy -> rowsBetween/rangeBetween (frame
+  depends on orderBy, so it goes last).
+- ROWS vs RANGE differ ONLY when orderBy has duplicate values (peers):
+  * RANGE bounds by VALUE: all equal-orderBy rows are peers, included
+    together (a peer's frame contains its peers). "Duplicate value" is
+    a meaningful concept to RANGE.
+  * ROWS bounds by physical ROW POSITION: each row is row N, N+1...;
+    duplicates are NOT special — ROWS never pools peers. Cost: which
+    duplicate is "row N" is nondeterministic (orderBy ties unresolved),
+    so a single row's running value can be nondeterministic. Harmless
+    when a downstream groupBy re-collapses the partition (Day 13); pin
+    a tie-break key in orderBy if a specific row's frame value matters.
+  * Day 13 both give the same session key because duplicate ts -> gap 0
+    -> flag 0, so pooled peers contribute 0. Prefer explicit ROWS when
+    peers could carry non-zero value — self-documenting + peer-safe
+    (the "if in doubt, pin ROWS" action).
+- FRAME AFFECTS ONLY frame-sensitive aggregates: sum / count / avg /
+  max / min / collect_list over a window respond to rowsBetween /
+  rangeBetween. Ranking & positional functions — row_number / rank /
+  dense_rank / lag / lead / ntile — IGNORE the frame entirely (their
+  semantics are pure position/rank). So unboundedPreceding & custom
+  frames are used ONLY with the aggregate family; setting a frame on
+  lag/rank is a no-op smell.
+
+## rangeBetween units + unboundedPreceding intent (Day 13)
+- rangeBetween(start,end) bounds take INTEGERS interpreted against the
+  orderBy column's type — NOT an interval Column. On a DATE orderBy the
+  int is DAYS: rangeBetween(-6, currentRow) = "last 6 days", pure DSL,
+  no expr. On a TIMESTAMP orderBy the int is SECONDS:
+  rangeBetween(-6*86400, currentRow) for 6 days. Same integer means a
+  different span on date vs timestamp — a 6-on-timestamp is a 6-SECOND
+  window (unit trap, Day 11 family). Only the `INTERVAL 6 DAYS PRECEDING`
+  literal syntax forces expr / raw SQL; the second-count stays pure DSL.
+- unboundedPreceding = frame START pinned to the PARTITION's first row
+  (per partitionBy, reset at each new partition key; "first" = earliest
+  under orderBy), NEVER sliding, NEVER crossing the partition boundary.
+  Choose by ONE question — does the start SLIDE with the current row?
+  * No, fixed at partition head -> unboundedPreceding = CUMULATIVE
+    (running total, cumulative max/min).
+  * Yes, follows current row -> finite offset rowsBetween(-N,..) /
+    rangeBetween(-secs,..) = SLIDING (moving average, last-6-days).
+  * unboundedPreceding + unboundedFollowing = WHOLE partition (total,
+    e.g. denominator for a cumulative-share ratio) = the partitionBy-
+    only no-orderBy "true total" frame (Day 8).
+
 ## Physical plans / explain()
 - Read bottom-up; key nodes: Scan (source + stats quality), Exchange
   (= one shuffle each, the cost driver), join node (strategy +
@@ -524,3 +611,9 @@
   it to `WHEN gid=k` (or `WHEN grouping(col)=1`). Companion to the Day 10
   "never rebuild a dim from IS NULL alone" — here the failure mode is the
   opposite direction (IS NULL present but superfluous), same fix: gid only.
+- Frame set on a ranking/positional function is a no-op smell (Day 13):
+  if you see rowsBetween / rangeBetween attached to row_number / rank /
+  dense_rank / lag / lead / ntile, the author likely misunderstands frames
+  — those functions ignore it entirely. Frames matter ONLY for
+  sum/count/avg/max/min/collect_list windows. Catch it by reading: a frame
+  on a positional function does nothing and signals a mental-model gap.
