@@ -1,4 +1,4 @@
-# Accumulated Key Takeaways (Days 1-13)
+# Accumulated Key Takeaways (Days 1-14)
 
 ## Window functions
 - dense_rank vs rank vs row_number: dense (1,2,2,3) / rank (1,2,2,4) /
@@ -490,6 +490,111 @@
     e.g. denominator for a cumulative-share ratio) = the partitionBy-
     only no-orderBy "true total" frame (Day 8).
 
+## Python UDFs: registration, serialization, cost (Day 14)
+- returnType is MANDATORY in practice: omitting it defaults to
+  StringType(), so an int-producing UDF silently yields STRINGS and the
+  tuple compare fails on TYPE, not value. Always `@F.udf(IntegerType())`.
+- A UDF is NOT NULL-aware. NULL arrives as Python None and the body runs
+  anyway — no short-circuit, no free propagation. Native expressions
+  propagate NULL for you; a UDF must defend explicitly or raise inside
+  the executor.
+- Decorator order for a class-hosted UDF: @staticmethod OUTERMOST,
+  @F.udf inner. Reversed, F.udf wraps a staticmethod DESCRIPTOR rather
+  than a function (uncallable pre-3.10). Static matters for
+  SERIALIZATION: an instance method drags `self`, so the whole object is
+  pickled to the executor and any unpicklable member (e.g. a
+  SparkSession ref) is a PicklingError. Module-level functions are the
+  smallest-scope default; class-hosted is fine but must be justifiable
+  as static in review.
+- @F.udf registers for DSL ONLY. Calling it from SQL without
+  spark.udf.register raises UNRESOLVED_ROUTINE. Two registration shapes:
+  * register(name, udf_object)        -> returnType comes FROM the UDF
+  * register(name, fn.func, retType)  -> `.func` unwraps to the raw
+    Python function, so retType is now REQUIRED
+  Passing BOTH a UDF object and a returnType raises
+  CANNOT_SPECIFY_RETURN_TYPE_FOR_UDF (Spark refuses to arbitrate two
+  return types). register() also RETURNS a usable UDF object, so one
+  call can serve both DSL and SQL. Registration scope = the current
+  SparkSession only; the SQL name need not match the Python name.
+- Cost model: BatchEvalPython serializes rows out to a Python worker and
+  back (pickle round trip), is an OPTIMIZER BARRIER (no pushdown
+  through it, no constant folding), and blocks whole-stage codegen for
+  that column. pandas_udf -> ArrowEvalPython: vectorized batches, far
+  less per-row overhead, same optimizer opacity. Rule: reach for a UDF
+  only when NO native expression exists — here str_to_map / split /
+  size / element_at cover the entire task natively.
+
+## String splitting exactness (Day 14)
+- `"".split("&")` returns `[""]` — length 1, NOT 0. An empty payload must
+  be intercepted BEFORE split; you cannot let len(split(...)) compute
+  n_params. Contrast the no-arg form: `"".split()` returns `[]`.
+  Different behaviour for the same method name — easy to conflate.
+- `"nosep".split("&")` returns `["nosep"]` — one element, never an error
+  and never an empty list. Single-param payloads need no special case;
+  only the empty string does.
+- Regex quantifier direction is the empty-value trap: `tier=([^&]+)`
+  requires >=1 char, so `tier=` does NOT match and falls through to the
+  'UNKNOWN' branch — but the spec reserved 'UNKNOWN' for an ABSENT key.
+  `+` -> `*` matches the empty value and group(1) is "".
+- Unanchored key regex mis-matches SUFFIXES: `tier=` matches inside
+  `user_tier=gold`. Anchor with `(?:^|&)tier=([^&]*)`, or drop regex for
+  split('&') + partition('=') and compare the key EXACTLY — the latter
+  reads better in review and eliminates the whole boundary bug class.
+- `split(str, sep, limit)`: the third arg is the SQL cousin of Python's
+  str.partition. limit=2 keeps a value that contains the separator
+  intact ("a=b=c" -> ["a", "b=c"]).
+
+## Higher-order array functions — when transform is the right tool (Day 14)
+- Family and Python analogues: transform ~ map() (array -> equal-length
+  array); filter ~ filter() (array -> shorter array); aggregate ~
+  reduce() (array -> scalar); exists / forall ~ any() / all() (array ->
+  boolean); zip_with ~ zip()+map(); transform_keys / transform_values
+  for maps.
+- Core value: element-wise work AT ARRAY GRAIN without exploding — the
+  same no-explode discipline as Day 4, avoiding the
+  explode -> process -> collect_list round trip.
+- Decision order, in this sequence:
+  1. Is there a dedicated built-in? -> use it (str_to_map, array_distinct,
+     array_sort, array_max, array_contains). Do NOT hand-roll.
+  2. Does the grain need to change (one element -> one row)? -> explode.
+  3. Neither, and the array shape must survive -> transform / filter.
+- Anti-patterns: transform used to reduce to a scalar (use aggregate /
+  array_max); transform-to-booleans followed by array_contains(true)
+  (use exists); transform on a string you just split when a
+  format-specific built-in parses the whole thing.
+- The precondition the AI missed: higher-order functions fit when the
+  array IS the column's natural form. Manually splitting a STRING into
+  an array in order to reach for transform is the tell that a parsing
+  built-in was skipped.
+- Index-base mismatch inside one expression: array subscript arr[i] is
+  0-BASED, element_at(arr, i) is 1-BASED. Mixing `kv[0]` and
+  `element_at(..., 1)` in a single expression is legal and passes, but
+  it is a genuine readability defect in review.
+
+## ANSI mode governs out-of-bounds / failure behaviour (Day 14)
+- element_at, array subscript arr[i], cast, division by zero, arithmetic
+  overflow: under spark.sql.ansi.enabled these THROW; with ANSI off they
+  silently return NULL. ANSI defaults ON in Spark 4.x and off in 3.x, so
+  identical SQL changes FAILURE CLASS across versions and sessions.
+- Therefore any `COALESCE(risky_expr, fallback)` carries a hidden
+  assumption that risky_expr YIELDS a NULL. Under ANSI it never gets the
+  chance — the job dies before COALESCE runs. The AI's
+  COALESCE(UPPER(element_at(filter(...), 1)[1]), 'UNKNOWN') failed
+  exactly this way on rows with no `tier` key: filter -> empty array,
+  element_at(empty, 1) -> ArrayIndexOutOfBoundsException.
+- The try_* family is the explicit way to REQUEST NULL semantics:
+  try_element_at / try_cast / try_divide / try_add / try_subtract /
+  try_multiply / try_sum / try_avg. Config-independent by construction —
+  the fallback pattern only becomes true once the inner call is a try_*.
+- MAP access is NOT in this family: props['missing_key'] returns NULL
+  even under ANSI (the Day 6 rule still holds). One more reason the
+  str_to_map route never had this bug — the hand-rolled array route
+  MANUFACTURED a failure mode that the built-in cannot have.
+- `size(kv) = 2 AND kv[0] = 'tier'` guarding a subscript via AND
+  short-circuit is LUCK, not contract: SQL does not guarantee AND
+  evaluation order. Catalyst usually short-circuits; never build safety
+  on it. Use try_element_at, or a built-in that cannot go out of bounds.
+
 ## Physical plans / explain()
 - Read bottom-up; key nodes: Scan (source + stats quality), Exchange
   (= one shuffle each, the cost driver), join node (strategy +
@@ -617,3 +722,29 @@
   — those functions ignore it entirely. Frames matter ONLY for
   sum/count/avg/max/min/collect_list windows. Catch it by reading: a frame
   on a positional function does nothing and signals a mental-model gap.
+- "Is this NULL delivered or assumed?" (Day 14): a COALESCE / fallback
+  wrapped around an expression that can FAIL (element_at, subscript, cast,
+  divide) is only correct if that expression returns NULL rather than
+  throwing — and that is a SESSION CONFIG (ANSI), not a language guarantee.
+  Reading the fallback as evidence of NULL-safety is the mistake. Ask where
+  the NULL comes from; if the answer is "the function returns NULL on
+  failure", demand the try_* form. This is the failure-mode sibling of the
+  aggregate-NULL rule: that rule prunes defensive code because NULL handling
+  is guaranteed, this one ADDS defensive code because it isn't.
+- Hand-rolled parsing where a format built-in exists (Day 14): the AI built
+  a 5-layer split/transform/filter/element_at nest to parse a query string
+  that `str_to_map(payload,'&','=')` handles in one call. Two costs beyond
+  verbosity — it mixed 0-based subscript (kv[0]) with 1-based element_at in
+  ONE expression, and it manufactured an out-of-bounds failure mode the
+  built-in cannot have. Review trigger: a chain of generic array primitives
+  operating on a string that was just split is a signal to go look for the
+  format-specific function. Sibling of the Day 12 hallucination heuristic —
+  there the AI invented an API that didn't exist, here it ignored one that
+  did. Both are "did you check what the standard library already offers".
+- Empty-string vs absent is a SPEC question, not an edge case to smooth
+  over (Day 14): `tier=` (key present, value empty) and no `tier` key at all
+  are DIFFERENT states, and the spec reserved 'UNKNOWN' for the ABSENT case
+  only. A regex `+`, a truthiness check on the extracted value, or an
+  `if not value` guard all silently collapse the two. When a spec names a
+  sentinel for "absent", check what the code does with "present but empty"
+  BEFORE approving — the two paths look identical in the happy case.
