@@ -1,750 +1,730 @@
-# Accumulated Key Takeaways (Days 1-14)
+# 累积要点 (Day 1-15)
 
-## Window functions
-- dense_rank vs rank vs row_number: dense (1,2,2,3) / rank (1,2,2,4) /
-  row_number (unique, ties broken arbitrarily). Top-N with ties needs
-  dense_rank; gaps-and-islands needs row_number's strict +1.
-- dense_rank()/rank()/row_number() take NO arguments — ordering comes
-  entirely from the window's orderBy. F.dense_rank(F.col(...)) is a
-  TypeError.
-- A window without partitionBy forces all data into one partition —
-  performance killer on large tables; a standing review-checklist item.
+> 术语、API 名、函数名、报错类名一律保留英文;正文用中文。
+
+## 窗口函数
+- dense_rank vs rank vs row_number:dense (1,2,2,3) / rank (1,2,2,4) /
+  row_number(唯一,并列时任意断开)。带并列的 Top-N 要 dense_rank;
+  gaps-and-islands 要 row_number 严格 +1 的性质。
+- dense_rank()/rank()/row_number() **不接参数**——排序完全来自窗口的
+  orderBy。F.dense_rank(F.col(...)) 是 TypeError。
+- 没有 partitionBy 的窗口会把全部数据压进一个分区,大表上的性能杀手;
+  这是常驻 review checklist 项。
 
 ## Gaps-and-islands
-- (value - row_number) is constant within an island; for dates use
-  DATE_SUB(d, rn) as the anchor/island key.
-- Dedupe BEFORE numbering: a duplicate shifts rn and silently splits
-  a streak — passes on clean data, fails on dirty data.
+- (value - row_number) 在一个 island 内是常数;日期场景用
+  DATE_SUB(d, rn) 当 anchor / island key。
+- **先去重再编号**:一条重复行会把 rn 顶偏,静默地把一段连续streak 劈成
+  两段——干净数据上通过,脏数据上失败。
 
-## Deduplication (4 equivalent-ish forms)
-- SELECT DISTINCT A,B ≡ GROUP BY A,B (no aggregates) ≡
-  select(A,B).distinct() — identical physical plan (Aggregate);
-  one shuffle.
-- dropDuplicates(["A","B"]) keeps ALL columns; which row survives per
-  key is NONDETERMINISTIC.
-- Window row_number()=1 keeps all columns AND deterministically picks
-  the row (ORDER BY tie-breaker) — required for "keep latest per key".
-- Choose: keys only -> DISTINCT/GROUP BY; need other columns, any row
-  -> dropDuplicates; need other columns, specific row -> window.
+## 去重(四种近似等价形式)
+- SELECT DISTINCT A,B ≡ GROUP BY A,B(无聚合)≡ select(A,B).distinct()
+  ——物理计划完全相同(Aggregate),一次 shuffle。
+- dropDuplicates(["A","B"]) 保留**所有列**;每个 key 存活哪一行是
+  **不确定的**。
+- 窗口 row_number()=1 既保留所有列,又能确定性地挑行(靠 ORDER BY 的
+  tie-breaker)——"每个 key 保留最新"必须用它。
+- 选择:只要 key -> DISTINCT/GROUP BY;要其他列、任意一行 ->
+  dropDuplicates;要其他列、指定某一行 -> 窗口。
 
-## Keep-latest-per-key (Day 8, dedup applied)
-- orderBy(...).dropDuplicates(keys) is NOT a contract: may look right
-  locally, breaks on a real cluster (survivor still nondeterministic
-  after shuffle). "Keep latest" REQUIRES window rn=1 or struct-argmax.
-- struct-argmax works here with NO negation: both order keys are DESC
-  ("take large") -> max(struct(updated_at, source_seq, payload...)).
-  Payload fields ride along AFTER the sort keys — they are only
-  compared when all keys tie, which for exact-duplicate replays picks
-  between identical rows (harmless).
-- Per-key TOTAL alongside the surviving row: COUNT(*) OVER
-  (PARTITION BY key) with NO orderBy piggybacks on the SAME window
-  shuffle as row_number — one Exchange, one scan. The separate
-  groupBy-branch + join route costs a SECOND Exchange and a SECOND
-  scan of the source (join itself reuses the matching partitioning
-  via ENSURE_REQUIREMENTS, so the join adds no Exchange — the cost is
-  the extra branch, not the join).
-- Trade-off: window count has NO map-side partial aggregation; if you
-  need ONLY the count (no ranking), groupBy is better — partial agg
-  shrinks shuffle traffic. The piggyback only wins when a ranking
-  window already forces full rows through the shuffle anyway.
-- Ordered-window default frame trap: partitionBy-only window = whole
-  partition frame (true total); ADDING orderBy silently switches the
-  default frame to RANGE UNBOUNDED PRECEDING..CURRENT ROW, turning
-  count/sum OVER into a RUNNING aggregate — rn=1 row would read 1,
-  not the total. The count window must carry NO orderBy.
-- Exact-duplicate replays still count toward n_versions (count rows,
-  not distinct versions) — read the metric definition before reaching
-  for countDistinct.
+## 每个 key 保留最新(Day 8,去重的应用)
+- orderBy(...).dropDuplicates(keys) **不是契约**:本地看着对,真集群上
+  会坏(shuffle 之后存活行仍然不确定)。"保留最新"**必须**用窗口 rn=1
+  或 struct-argmax。
+- 这里的 struct-argmax **不需要取负**:两个排序键方向一致(都是 DESC /
+  "取大")-> max(struct(updated_at, source_seq, payload...))。payload 字段
+  跟在排序键**后面**搭便车,只有所有排序键都并列时才会被比较;对精确重放的
+  重复行来说是在两条完全相同的行之间选,无害。
+- 存活行旁边还要每个 key 的总数:COUNT(*) OVER (PARTITION BY key) 且
+  **不带 orderBy**,能搭上 row_number 的**同一次** window shuffle——一个
+  Exchange、一次扫描。另开一个 groupBy 分支再 join 的路线要多付**第二个**
+  Exchange 和**第二次**源表扫描(join 本身通过 ENSURE_REQUIREMENTS 复用了
+  匹配的分区,不加 Exchange——代价在多出来的那个分支,不在 join)。
+- 取舍:window count **没有** map 端 partial aggregation;如果你**只**要
+  计数(不做排名),groupBy 更好——partial agg 能缩小 shuffle 流量。
+  搭便车只在"已经有一个排名窗口逼着整行过 shuffle"时才划算。
+- **有序窗口默认 frame 陷阱**:只有 partitionBy 的窗口 = 整个分区的 frame
+  (真·总计);**加上 orderBy** 会把默认 frame 静默切换成
+  RANGE UNBOUNDED PRECEDING..CURRENT ROW,于是 count/sum OVER 变成
+  **累计**聚合——rn=1 那行读到的是 1,不是总数。计数窗口必须**不带**
+  orderBy。
+- 精确重放的重复行**仍然**计入 n_versions(数的是行,不是不同版本数)
+  ——先读清楚指标定义再去伸手拿 countDistinct。
 
-## Window shuffle mechanics (spec, not function)
-- Shuffle belongs to the window SPEC, not the function: row_number /
-  rank / lag / count-over all cost the same — one Exchange per
-  DISTINCT partitionBy expression in the query. Same partitionBy ->
-  windows share one Exchange; different partitionBy -> one each.
-- orderBy inside a window adds a SORT after the Exchange, not another
-  shuffle. No partitionBy = all rows to ONE partition (still one
-  Exchange, but the single-partition killer).
-- Review a query's window cost by counting DISTINCT partitionBy
-  expressions, then checking for bare windows.
+## 窗口 shuffle 机制(属于 spec,不属于函数)
+- shuffle 属于 window **SPEC**,不属于函数:row_number / rank / lag /
+  count-over 代价相同——查询里每有一个**不同的** partitionBy 表达式,
+  就是一个 Exchange。相同 partitionBy -> 共用一个 Exchange;不同 -> 各一个。
+- 窗口里的 orderBy 只在 Exchange 之后加一个 SORT,不是另一次 shuffle。
+  没有 partitionBy = 全部行进**一个**分区(仍然只有一个 Exchange,但是
+  单分区杀手)。
+- 审查一个查询的窗口代价:数**不同的** partitionBy 表达式个数,然后检查
+  有没有裸窗口。
 
 ## Pivot
-- pivot(col) without a values list triggers an EXTRA job (distinct +
-  collect to driver) and makes the output schema data-dependent
-  (schema drift). Always pass the list when the domain is known.
-- The values list is also a FILTER: values not listed are silently
-  dropped.
-- Pivot cells with no data are NULL, not 0 — na.fill / COALESCE
-  explicitly.
-- Single aggregation: alias does NOT affect column names (pure values).
-  Multiple aggregations: columns become <value>_<agg_alias>; count =
-  |values| x |aggs|.
-- In pivot's aggregation context F.count("*") fails to resolve
-  (INVALID_USAGE_OF_STAR_OR_REGEX). Use F.count(F.lit(1)) in DSL
-  everywhere; COUNT(*) in SQL is fine everywhere.
-- Conditional aggregation SUM(CASE WHEN...) is the portable equivalent;
-  nearly identical plan once the pivot list is explicit.
+- pivot(col) 不给 values 列表会触发一个**额外 job**(distinct + collect
+  回 driver),并且让输出 schema 依赖数据(schema drift)。domain 已知时
+  永远显式传列表。
+- values 列表同时也是**过滤器**:没列进去的值被静默丢弃。
+- 没有数据的 pivot 单元格是 NULL,不是 0——显式 na.fill / COALESCE。
+- 单个聚合:alias **不**影响列名(纯值)。多个聚合:列名变成
+  <value>_<agg_alias>;列数 = |values| x |aggs|。
+- 在 pivot 的聚合上下文里 F.count("*") 解析失败
+  (INVALID_USAGE_OF_STAR_OR_REGEX)。DSL 里一律用 F.count(F.lit(1));
+  SQL 里 COUNT(*) 处处可用。
+- 条件聚合 SUM(CASE WHEN...) 是可移植的等价写法;一旦 pivot 列表显式给出,
+  两者计划几乎相同。
 
-## Arrays
-- explode() DROPS rows with empty/NULL arrays; explode_outer() keeps
-  them (item = NULL). The #1 array-column bug.
-- No-explode route: collect_list(arrays) -> flatten -> array_distinct /
-  array_sort / size does group-level array math without row explosion.
-- collect_set dedupes at map-side partial aggregation (smaller shuffle);
-  collect_list preserves duplicates. Element order of collect_set is
-  nondeterministic — array_sort before comparing.
-- sort_array vs array_sort: both ascending by default; differ in NULL
-  placement (first vs last) and extras (bool desc flag vs lambda
-  comparator, 3.0+).
-- SIZE(NULL) = -1 (legacy quirk) — COALESCE-guard nullable arrays.
+## 数组
+- explode() **丢弃**空数组/NULL 数组的行;explode_outer() 保留(元素为
+  NULL)。数组列的头号 bug。
+- 不 explode 的路线:collect_list(arrays) -> flatten -> array_distinct /
+  array_sort / size,在组级别做数组运算,不用把行炸开。
+- collect_set 在 map 端 partial aggregation 时就去重(shuffle 更小);
+  collect_list 保留重复。collect_set 的元素顺序**不确定**——比较前先
+  array_sort。
+- sort_array vs array_sort:都默认升序;区别在 NULL 的位置(前 vs 后)和
+  附加能力(bool 降序标志 vs lambda comparator,3.0+)。
+- SIZE(NULL) = -1(遗留怪癖)——可空数组要 COALESCE 兜底。
 
-## NULL semantics of aggregates
-- ALL aggregate functions (count/sum/avg/collect_list/collect_set...)
-  ignore NULL inputs. This one rule kills two review categories:
-  missing-NULL-handling bugs AND redundant defensive code
-  (filter(isNotNull) before collect_set, coalesce after na.fill).
-- COUNT(column) counts non-NULL only; returns 0 (never NULL) for
-  all-NULL groups. Footgun in one context (silent undercount), the
-  right tool in another (zeroing empty-array customers after
-  explode_outer).
-- CASE WHEN ... ELSE 0 vs no-ELSE + COALESCE: both valid NULL
-  strategies but must be paired consistently.
+## 聚合函数的 NULL 语义
+- **所有**聚合函数(count/sum/avg/collect_list/collect_set...)都忽略
+  NULL 输入。这一条规则同时消灭两类 review 项:漏处理 NULL 的 bug,
+  **以及**冗余的防御代码(collect_set 前的 filter(isNotNull)、na.fill
+  之后的 coalesce)。
+- COUNT(column) 只数非 NULL;全 NULL 的组返回 0(永远不是 NULL)。
+  在一种语境下是陷阱(静默少算),在另一种语境下正是对的工具
+  (explode_outer 之后把空数组客户归零)。
+- CASE WHEN ... ELSE 0 vs 不写 ELSE + COALESCE:两种 NULL 策略都合法,
+  但必须成对一致使用。
 
-## Joins
-- on="key" (string) merges the join key into ONE column; for left
-  joins the merged key takes the LEFT side's value (orphan keys
-  survive). Expression joins (a.k == b.k) keep BOTH columns ->
-  AMBIGUOUS_REFERENCE risk; disambiguate via df["col"], alias
-  qualification, or drop one side immediately.
-- Self-joins REQUIRE aliases; even F.col is ambiguous there.
-- LEFT join + COALESCE(dim_col, 'UNKNOWN') = standard pattern so
-  unmatched fact rows survive enrichment; inner join silently loses
-  revenue.
-- Broadcast: F.broadcast(dim) / /*+ BROADCAST(alias) */ wraps the
-  SMALL side. Three-tier mechanism: explicit hint (unconditional) >
-  static autoBroadcastJoinThreshold (needs size STATISTICS — missing
-  stats e.g. Scan ExistingRDD are treated as infinitely large, so no
-  auto-broadcast) > AQE runtime conversion (real sizes at shuffle
-  boundaries, but initial shuffles already paid). Cost order:
-  explicit < AQE conversion < full SortMergeJoin.
-- Single-block GROUP BY with transformed keys: repeat the EXACT
-  expression in GROUP BY, or lift the transform into a CTE/subquery
-  (cleanest — one copy, no drift). GROUP BY alias resolves input
-  columns FIRST (silent rebinding) and is non-portable.
+## Join
+- on="key"(字符串)把 join key 合并成**一列**;left join 时合并后的 key
+  取**左侧**的值(孤儿 key 得以存活)。表达式 join(a.k == b.k)保留
+  **两列** -> AMBIGUOUS_REFERENCE 风险;用 df["col"]、alias 限定,或立刻
+  drop 掉一侧来消歧。
+- 自连接**必须**用 alias;那里连 F.col 都是有歧义的。
+- LEFT join + COALESCE(dim_col, 'UNKNOWN') 是标准 enrichment 模式,让
+  未匹配的事实行存活;inner join 会静默丢掉营收。
+- Broadcast:F.broadcast(dim) / /*+ BROADCAST(alias) */ 包住**小**的一侧。
+  三层机制:显式 hint(无条件)> 静态 autoBroadcastJoinThreshold(需要
+  size **统计信息**——缺统计信息如 Scan ExistingRDD 会被当成无穷大,
+  于是不会自动 broadcast)> AQE 运行时转换(拿到真实大小,但初始 shuffle
+  已经付过了)。代价排序:显式 < AQE 转换 < 完整 SortMergeJoin。
+- 单块 GROUP BY 里用了变换过的 key:要么在 GROUP BY 里**原样重复**同一个
+  表达式,要么把变换提到 CTE/子查询里(最干净——只有一份,不会漂移)。
+  GROUP BY 写 alias 会**优先解析输入列**(静默改绑定)且不可移植。
 
-## Semi / anti joins & IN / EXISTS (Day 9)
-- left_semi / left_anti are FILTERS wearing join syntax: output schema =
-  LEFT table only, never emit right-side columns, never multiply rows.
-  semi = EXISTS (keep left iff >=1 match); anti = NOT EXISTS (keep left
-  iff no match). NOT a join-then-distinct.
-- Catalyst decorrelation compiles ALL of these to the same LeftSemi /
-  LeftAnti logical operators: IN (subquery), EXISTS, LEFT SEMI JOIN
-  syntax, DSL left_semi -> LeftSemi; NOT IN (safe), NOT EXISTS,
-  LEFT ANTI JOIN, DSL left_anti -> LeftAnti. Confirmed via explain():
-  a query mixing NOT EXISTS + IN produced two BroadcastHashJoin nodes,
-  one LeftAnti (from NOT EXISTS) + one LeftSemi (from IN), traced by
-  the right-side attribute's Scan lineage.
-- Why IN (subquery) becomes semi, not inner: IN means "appears at least
-  once" -> must NOT duplicate left rows (orders with 3 matching rows
-  still yields 1 customer row) AND must NOT emit right columns. Both
-  constraints ARE the semi-join definition.
+## Semi / anti join 与 IN / EXISTS (Day 9)
+- left_semi / left_anti 是**穿着 join 语法的过滤器**:输出 schema = 只有
+  左表,永不发出右侧列,永不放大行数。semi = EXISTS(左行有 >=1 个匹配就
+  保留);anti = NOT EXISTS(没有匹配才保留)。**不是** join 完再 distinct。
+- Catalyst 的 decorrelation 把下面这些全部编译成同一组 LeftSemi / LeftAnti
+  逻辑算子:IN (subquery)、EXISTS、LEFT SEMI JOIN 语法、DSL left_semi ->
+  LeftSemi;NOT IN(安全时)、NOT EXISTS、LEFT ANTI JOIN、DSL left_anti ->
+  LeftAnti。已用 explain() 验证:一个混用 NOT EXISTS + IN 的查询产生了两个
+  BroadcastHashJoin 节点,一个 LeftAnti(来自 NOT EXISTS)+ 一个 LeftSemi
+  (来自 IN),通过右侧属性的 Scan 血缘追踪确认。
+- 为什么 IN (subquery) 变成 semi 而不是 inner:IN 的含义是"至少出现一次"
+  -> 既**不能**放大左侧行(一个客户匹配 3 条订单仍然只出 1 行),**也不能**
+  发出右侧列。这两个约束**就是** semi join 的定义。
 
-## NOT IN vs NOT EXISTS — three-valued-logic footgun
-- NOT IN + subquery containing ANY NULL -> whole query returns ZERO
-  rows: x <> NULL is UNKNOWN, so x NOT IN (..., NULL) is never TRUE.
-  This is the negation-direction trap; positive IN is unaffected (a
-  match is still TRUE, NULL just fails to match).
-- NOT IN safety requires NO NULL on BOTH sides: subquery side AND outer
-  column. isNotNull() on the subquery only patches ONE side; an outer
-  NULL still yields NULL NOT IN (...) = UNKNOWN, silently dropped.
-- NOT EXISTS / LEFT ANTI are NULL-safe by construction (built on =,
-  NULL simply doesn't match) -> the correct DEFAULT for negated
-  existence. Replacing NOT IN with NOT EXISTS is "choosing the right
-  semantics" (NULL = not-a-match), NOT a blind equivalent rewrite:
-  under NULLs the two genuinely differ, and standard NOT IN's
-  NULL-poisoning is occasionally the intended behavior.
-- Shuffle cost: once NOT IN is safely decorrelatable (no subquery-side
-  NULL), it compiles to the SAME LeftAnti as NOT EXISTS -> identical
-  Exchange count (0 if broadcast, 1-per-key if SMJ). The difference is
-  NOT shuffle; it's the extra deletable filter-precondition NOT IN
-  carries. When NOT IN CANNOT decorrelate (nullable subquery, no
-  filter), Catalyst inserts a NULL-aware anti join -> can degrade to
-  BroadcastNestedLoopJoin / extra null-check predicate = heavier plan.
-  isNotNull() rescues NOT IN from the heavy plan back to the LeftAnti
-  light plan.
+## NOT IN vs NOT EXISTS —— 三值逻辑陷阱
+- NOT IN + 子查询里**含任何 NULL** -> 整个查询返回**零行**:x <> NULL 是
+  UNKNOWN,所以 x NOT IN (..., NULL) 永远不为 TRUE。这是**否定方向**特有的
+  陷阱;正向的 IN 不受影响(匹配仍然是 TRUE,NULL 只是匹配不上)。
+- NOT IN 的安全性要求**两侧**都没有 NULL:子查询侧**和**外层列。
+  在子查询上加 isNotNull() 只补了**一侧**;外层的 NULL 仍然让
+  NULL NOT IN (...) = UNKNOWN,被静默丢弃。
+- NOT EXISTS / LEFT ANTI 天生 NULL 安全(建立在 = 之上,NULL 只是匹配不上)
+  -> 否定存在性的**正确默认选择**。把 NOT IN 换成 NOT EXISTS 是"选择正确的
+  语义"(NULL = 不匹配),**不是**无脑等价改写:有 NULL 时两者确实不同,而
+  标准 NOT IN 的 NULL 毒化偶尔正是想要的行为。
+- shuffle 代价:一旦 NOT IN 能安全 decorrelate(子查询侧无 NULL),它编译成
+  和 NOT EXISTS **相同**的 LeftAnti -> Exchange 数完全一样(broadcast 则 0,
+  SMJ 则每个 key 一次)。差别**不在** shuffle,而在 NOT IN 多背了一个
+  可删除的过滤前提。当 NOT IN **无法** decorrelate(子查询可空、又没有过滤)
+  时,Catalyst 会插入 NULL-aware anti join -> 可能退化成
+  BroadcastNestedLoopJoin / 额外的 null 检查谓词 = 更重的计划。
+  isNotNull() 把 NOT IN 从重计划救回轻的 LeftAnti 计划。
 
-## Redundant defensive code — join edition (Day 9)
-- distinct() on the RIGHT side before semi/anti is redundant: existence
-  semantics already ignore right-side multiplicity (1 match vs 100
-  matches -> same left-row survival). It adds nothing to correctness
-  but deterministically adds ONE groupBy Exchange (has partial-agg
-  relief, but still a net-new shuffle). The Day-9 join-clothing version
-  of "aggregate semantics already cover this filter" — semi/anti never
-  multiply, so the right side never needs deduping.
-- Inner-join-as-existence-test is the OPPOSITE mistake: it DOES multiply
-  (grain change, Day 4/6 lesson in join clothing), forcing a downstream
-  distinct/dropDuplicates that's easy to forget. Prefer semi join,
-  which encodes "exists, don't multiply" directly.
+## 冗余防御代码 —— join 版 (Day 9)
+- semi/anti 之前对**右侧** distinct() 是冗余的:存在性语义本来就忽略右侧的
+  重数(匹配 1 次和匹配 100 次 -> 左行存活情况相同)。它对正确性零贡献,却
+  确定地增加**一个** groupBy Exchange(虽有 partial-agg 缓解,仍是净增一次
+  shuffle)。这是 Day 9 版的"聚合语义已经覆盖了这个过滤"——semi/anti 永不
+  放大行数,所以右侧永远不需要去重。
+- 用 inner join 做存在性判断是**相反**的错误:它**会**放大(改变 grain,
+  Day 4/6 的教训换了身 join 的衣服),逼得下游必须补一个很容易忘的
+  distinct/dropDuplicates。优先用 semi join,它直接把"存在但不放大"编码在
+  语义里。
 
-## Maps
-- map_keys / map_values / map_entries ~= dict.keys()/.values()/.items();
-  all return ARRAY columns, so downstream work uses the array-function
-  family (size, flatten, array_distinct...).
-- map_keys(NULL) / map_values(NULL) return NULL, NOT an empty array.
-  NULL map vs empty map is a real distinction that ripples downstream.
-- Map access (props['k'], .getItem, element_at) returns NULL for both
-  a missing key and a NULL map — never errors. Safe in filters
-  (aggregate-NULL rule absorbs it), silent when debugging.
-- explode() on a map emits TWO columns (key, value); explode on
-  map_keys(...) emits one. Same drop-rule as arrays (Day 4):
-  explode drops NULL/empty maps, explode_outer keeps the row.
-- Dedup unit must match the row grain: at exploded grain keys are
-  scalar elements, so collect_set(key) dedupes keys directly; at
-  un-exploded grain each element is a whole ARRAY, so collect_set
-  dedupes arrays ([] counts as a member!) — must
-  flatten -> array_distinct instead. Companion rule to "explode
-  changes grain, re-examine every COUNT" (count -> countDistinct(id)).
-- countDistinct is pricier than count (expand/two-phase aggregation,
-  weaker map-side partial agg) — the hidden cost of the explode route;
-  verify via explain(), not memory.
+## Map
+- map_keys / map_values / map_entries ≈ dict.keys()/.values()/.items();
+  全都返回 **ARRAY** 列,所以后续处理走数组函数家族(size, flatten,
+  array_distinct...)。
+- map_keys(NULL) / map_values(NULL) 返回 **NULL,不是空数组**。NULL map 和
+  空 map 是真实存在的区别,会一路影响下游。
+- Map 取值(props['k'] / .getItem / element_at)对"key 不存在"和"map 为
+  NULL"都返回 NULL——**永不报错**。在过滤里是安全的(被聚合-NULL 规则吸收),
+  调试时是静默的。
+- 对 map explode() 会产生**两列**(key, value);对 map_keys(...) explode
+  只有一列。丢弃规则和数组相同(Day 4):explode 丢掉 NULL/空 map,
+  explode_outer 保留该行。
+- **去重的单位必须匹配行的 grain**:在 explode 之后的 grain 上,key 是标量
+  元素,所以 collect_set(key) 直接对 key 去重;在未 explode 的 grain 上,
+  每个元素是**整个数组**,collect_set 是对数组去重([] 也算一个成员!)
+  ——必须改成 flatten -> array_distinct。"explode 改变 grain,重新检查每个
+  COUNT"(count -> countDistinct(id))的姊妹条。
+- countDistinct 比 count 贵(expand / 两阶段聚合,map 端 partial agg 更弱)
+  ——这是 explode 路线的隐藏成本;用 explain() 验证,别凭记忆。
 
-## Structs
-- Nested field access: device.os / F.col("device.os") /
-  df["device"]["os"] are equivalent (dot-path, positional, fixed
-  schema). A struct is NOT a map: fixed named fields, no dynamic keys,
-  no element_at, no explode on a plain struct — explode is for the
-  array(struct<...>) shape only.
-- NULL parent struct vs NULL sub-field: accessing device.os when the
-  WHOLE struct is NULL returns NULL (no error) — the SAME NULL as an
-  explicitly-NULL os sub-field. Once you project device.os the two are
-  INDISTINGUISHABLE. This is why the aggregate-NULL rule makes
-  countDistinct(device.os) / COUNT(device.os) "just work" for both
-  cases — but ALSO the trap: COUNT(device.os) counts every non-NULL os
-  (macOS included), which is NOT "mobile events". mobile_events needs a
-  conditional count over an explicit set — count(when(array_contains(
-  [iOS,Android], os), 1)) — not COUNT(device.os). Clean rows where all
-  non-null os happen to be mobile make the wrong version
-  coincidentally-correct (camouflage again).
-- primary_os = argmax-per-group. Three routes, all needing NULL-os
-  pre-filter + deterministic tie-break:
-  (a) row_number() over (partitionBy user orderBy cnt desc, os asc),
-      keep rn=1 — most general, needed for Top-N>1 or multi-column keep.
-  (b) min/max(struct(...)) — struct compares lexicographically field by
-      field. See "struct composite-key argmax" below.
-  (c) array_sort of collected (cnt,os) structs, take head.
-  All three then LEFT JOIN back to the per-user base so a user with NO
-  usable os still emits a row; COALESCE(primary_os,'UNKNOWN') fills it.
-  Inner join would silently drop the all-NULL-os user — same lesson as
-  Day 5 fact-dim enrichment.
+## Struct
+- 嵌套字段访问:device.os / F.col("device.os") / df["device"]["os"] 三者
+  等价(dot-path、按位置、固定 schema)。**struct 不是 map**:字段名固定、
+  没有动态 key、没有 element_at、不能对普通 struct 做 explode——explode 只
+  适用于 array(struct<...>) 这种形状。
+- **父 struct 为 NULL vs 子字段为 NULL**:整个 device 为 NULL 时访问
+  device.os 返回 NULL(不报错)——和显式把 os 置 NULL 得到**同一个** NULL。
+  一旦你 project 出 device.os,两者**不可区分**。这正是聚合-NULL 规则让
+  countDistinct(device.os) / COUNT(device.os) "刚好能用"的原因——但**也是**
+  陷阱:COUNT(device.os) 数的是所有非 NULL 的 os(macOS 也算),这**不是**
+  "mobile events"。mobile_events 需要对一个显式集合做条件计数——
+  count(when(array_contains([iOS,Android], os), 1))——而不是 COUNT(device.os)。
+  当干净数据里非空的 os 恰好全是移动端时,错的写法会"碰巧正确"(又一次伪装)。
+- primary_os = 组内 argmax。三条路线,都需要先过滤 NULL os + 确定性
+  tie-break:
+  (a) row_number() over (partitionBy user orderBy cnt desc, os asc),取 rn=1
+      ——最通用,Top-N>1 或要保留多列时必须用它。
+  (b) min/max(struct(...))——struct 按字段逐个字典序比较。见下面"struct
+      复合键 argmax"。
+  (c) 把 (cnt,os) struct 收集起来 array_sort,取头元素。
+  三条路线之后都要 LEFT JOIN 回每用户基表,让一个**没有**可用 os 的用户
+  仍然出行;COALESCE(primary_os,'UNKNOWN') 填空。inner join 会静默丢掉
+  os 全为 NULL 的用户——和 Day 5 事实-维度 enrichment 是同一个教训。
 
-## Struct composite-key argmax: min/max(struct(...))
-- min/max on a struct<f1,f2,...> compares fields left-to-right,
-  lexicographically (like a tuple). min drives ALL fields toward
-  small, max drives ALL fields toward large — one direction for the
-  whole struct, you cannot mix per-field directions natively.
-- To encode "cnt DESC, os ASC" (conflicting directions) under a single
-  aggregate: pick the aggregate for the tie-break field's direction,
-  then NEGATE whichever field fights it. os asc = "take small" -> use
-  min; cnt desc conflicts with min's "small", so negate it ->
-  min(struct(-cnt, os)), then .select("best.os"). Equivalent to
-  max(struct(cnt, ...)) when there's no conflicting tie-break; the
-  negation is ONLY needed to reconcile opposite sort directions.
-  Strings have no unary minus, so if the tie-break field needs the
-  direction that fights max/min, min-with-negated-numeric is the clean
-  escape hatch.
-- No general multi-key argmax in Spark. max_by(value, ordering) takes
-  a SINGLE ordering column and gives NO tie-break guarantee — cannot
-  express "cnt desc + os asc" deterministically. Hence row_number /
-  struct-argmax / array_sort are the real options.
-- Perf: struct-argmax vs window BOTH cost 2 shuffles here (groupBy
-  (user,os) then re-partition by user — (user,os)->(user) is
-  superset->subset, no reuse). The win is NOT shuffle count: the second
-  stage of struct-argmax is a groupBy+min AGGREGATE (map-side partial
-  agg, tiny data crosses the shuffle), whereas window's second stage is
-  a full SORT + Window over every os row (no partial-agg relief).
-  Confirm by explain(): both show 2 Exchanges, but struct route's
-  second is a HashAggregate pair, window route's is Sort+Window.
-  Don't record the conclusion as "fewer shuffles" — that's wrong;
-  record it as "aggregate beats sort at the second Exchange".
+## struct 复合键 argmax: min/max(struct(...))
+- 对 struct<f1,f2,...> 取 min/max 是**从左到右逐字段字典序**比较(像 tuple)。
+  min 把**所有**字段推向小,max 把**所有**字段推向大——整个 struct 只有一个
+  方向,原生**无法**按字段分别指定方向。
+- 要在单个聚合里表达"cnt DESC, os ASC"(方向冲突):先按 **tie-break 字段**
+  的方向选聚合函数,再把**跟它打架**的字段取负。os asc = "取小" -> 用 min;
+  cnt desc 和 min 的"取小"冲突,所以取负 -> min(struct(-cnt, os)),然后
+  .select("best.os")。当没有冲突的 tie-break 时它等价于 max(struct(cnt,...));
+  取负**只**用于调和相反的排序方向。字符串没有一元负号,所以当 tie-break 字段
+  需要的方向和 max/min 打架时,"min + 数值取负"是干净的逃生口。
+- Spark **没有**通用的多键 argmax。max_by(value, ordering) 只接**一个**排序列,
+  且**不保证** tie-break——无法确定性地表达"cnt desc + os asc"。所以真正的
+  选项就是 row_number / struct-argmax / array_sort。
+- 性能:struct-argmax 和 window 在这里**都是 2 次 shuffle**(先 groupBy
+  (user,os),再按 user 重分区——(user,os)->(user) 是超集->子集,无法复用)。
+  优势**不在** shuffle 次数:struct-argmax 的第二阶段是 groupBy+min **聚合**
+  (有 map 端 partial agg,过 shuffle 的数据很小),而 window 的第二阶段是对
+  每一行 os 做完整 SORT + Window(没有 partial-agg 缓解)。用 explain() 确认:
+  两者都显示 2 个 Exchange,但 struct 路线的第二个是一对 HashAggregate,
+  window 路线的是 Sort+Window。**别把结论记成"shuffle 更少"——那是错的;
+  记成"第二个 Exchange 处聚合胜过排序"。**
 
-## Complex aggregation: GROUPING SETS / ROLLUP / CUBE (Day 10)
-- Three DIFFERENT layers, not siblings:
-  * GROUPING SETS / ROLLUP / CUBE are GROUP-BY clauses — they decide
-    WHICH grains (rows) get produced. GROUPING SETS = list exactly the
-    grains you want (most precise). ROLLUP(a,b) = hierarchical subset
-    {(a,b),(a),()} — assumes a->b drill-down, DOES NOT include (b).
-    CUBE(a,b) = all 2^n subsets {(a,b),(a),(b),()}.
-    Equivalences: CUBE(a,b) == GROUPING SETS ((a,b),(a),(b),());
-    ROLLUP(a,b) == GROUPING SETS ((a,b),(a),()). CUBE/ROLLUP are just
-    syntax sugar for common GROUPING SETS combinations.
-  * GROUPING(col) is an AGGREGATE FUNCTION returning 0/1 — reads, per
-    output row, "was this col rolled up here?" (1 = aggregated away /
-    subtotal dim, 0 = real value). ONLY reliable "is this a subtotal"
-    signal: a bare `col IS NULL` cannot tell a real-NULL source value
-    from the NULL the rollup machinery injects on subtotal rows (echoes
-    Day 7 "NULL origin lost once projected"; GROUPING() recovers it).
-  * GROUPING_ID(c1,...,cn) packs the per-col grouping bits into one int:
-    LEFTMOST arg = HIGH bit. GROUPING_ID(region,category): region=bit1
-    (value 2), category=bit0 (value 1). 0=base grain, all-ones=grand
-    total. One CASE on the int maps cleanly to a 'level' label; the
-    per-col grouping() form (gr==0 & gc==0 ...) is more verbose but
-    self-documenting (no bit-order recall).
-- Rule of thumb: GROUPING SETS/CUBE/ROLLUP PRODUCE the multi-grain rows;
-  GROUPING/GROUPING_ID READ the label on each row. First makes data,
-  second interprets it.
-- DSL gap: there is df.cube(...) / df.rollup(...) + F.grouping /
-  F.grouping_id, but NO df.grouping_sets() helper. To get "specific
-  grains only" in pure DSL: cube-then-filter, or explicit groupBy+union,
-  or switch to SQL. 2-dim cube here wastes nothing (its 4 subsets ARE
-  the 4 wanted grains); with n dims cube = 2^n rows (combinatorial
-  blow-up), so prefer GROUPING SETS to name exact grains — same
-  "explicit values list" philosophy as Day 3 pivot.
-- Single source scan: grouping sets / cube / rollup read the table ONCE
-  and expand internally — physical plan shows one Expand (row-multiplying
-  operator that fills NULL for non-participating dims) + one Exchange +
-  HashAggregate pair. The 4-groupBy-union route scans the source 4x with
-  4 separate Exchanges. Verify by counting Expand/Exchange in .explain().
+## 复杂聚合: GROUPING SETS / ROLLUP / CUBE (Day 10)
+- 这是**三个不同的层次**,不是并列的兄弟:
+  * GROUPING SETS / ROLLUP / CUBE 是 **GROUP BY 子句**——决定**产生哪些
+    grain(哪些行)**。GROUPING SETS = 精确列出你要的 grain(最精准)。
+    ROLLUP(a,b) = 层级子集 {(a,b),(a),()}——假定 a->b 的下钻关系,
+    **不包含** (b)。CUBE(a,b) = 全部 2^n 个子集 {(a,b),(a),(b),()}。
+    等价关系:CUBE(a,b) == GROUPING SETS ((a,b),(a),(b),());
+    ROLLUP(a,b) == GROUPING SETS ((a,b),(a),())。CUBE/ROLLUP 只是常用
+    GROUPING SETS 组合的语法糖。
+  * GROUPING(col) 是**聚合函数**,返回 0/1——对每个输出行回答"这一列在这里
+    被卷起来了吗"(1 = 被聚掉/小计维度,0 = 真实值)。这是判断"这行是不是
+    小计"的**唯一可靠信号**:裸的 `col IS NULL` 分不清源数据里真实的 NULL
+    和 rollup 机制注入的 NULL(呼应 Day 7"NULL 的来源在 project 之后就丢了";
+    GROUPING() 把它找回来)。
+  * GROUPING_ID(c1,...,cn) 把每列的 grouping 位打包成一个整数:
+    **最左参数 = 最高位**。GROUPING_ID(region,category):region=bit1(值 2),
+    category=bit0(值 1)。0=基础 grain,全 1=总计。对这个整数做一次 CASE 就能
+    干净地映射出 'level' 标签;按列写的 grouping() 形式(gr==0 & gc==0 ...)
+    更啰嗦但自解释(不需要回忆位序)。
+- 口诀:GROUPING SETS/CUBE/ROLLUP **生产**多 grain 的行;GROUPING/GROUPING_ID
+  **读取**每行上的标签。前者造数据,后者做解释。
+- **DSL 缺口**:有 df.cube(...) / df.rollup(...) + F.grouping / F.grouping_id,
+  但**没有** df.grouping_sets() 这个 helper。纯 DSL 里要"只要特定 grain":
+  cube 之后再过滤,或显式 groupBy+union,或改用 SQL。这里 2 维 cube 不浪费
+  (它的 4 个子集**就是**要的 4 个 grain);n 维时 cube = 2^n 行(组合爆炸),
+  所以优先用 GROUPING SETS 点名精确的 grain——和 Day 3 pivot 的"显式 values
+  列表"是同一种哲学。
+- **单次源扫描**:grouping sets / cube / rollup 只读表**一次**,在内部展开;
+  物理计划显示一个 Expand(负责放大行、给不参与的维填 NULL 的算子)+ 一个
+  Exchange + 一对 HashAggregate。而 4 个 groupBy 再 union 的路线要扫源表
+  **4 次**、4 个独立 Exchange。在 .explain() 里数 Expand/Exchange 来验证。
 
-## Real-NULL vs subtotal-NULL — two robust strategies (Day 10)
-- The problem: a genuinely-NULL source dimension and the NULL that
-  cube/rollup injects on a subtotal row are INDISTINGUISHABLE once
-  projected. Two clean routes, different robustness profiles:
-  * PRE-FILL SENTINEL (chosen route): coalesce(dim, '<sentinel>')
-    BEFORE cube. Kills the source NULL entirely, so every remaining NULL
-    can only be a subtotal NULL. Most robust — removes the confusion at
-    the root; you can then rebuild dims from grouping_id ALONE without
-    ever touching IS NULL. Cost: sentinel string could collide with a
-    real dim value (guard by choosing an impossible sentinel).
-  * POST-HOC DISCRIMINATE (reference route): keep the NULL, branch
-    GROUPING(dim)==1 -> 'ALL' BEFORE IS NULL -> sentinel. More "correct"
-    (doesn't mutate source) but ORDER-SENSITIVE: reverse the two
-    branches and real-NULL + subtotal-NULL collapse together. The
-    fragile path — the branch order is a deletable invariant the next
-    editor can break.
-- cast('long') on SUM(int): SUM(int)->bigint; explicit cast is schema
-  hygiene for production sinks (check() won't catch either way).
+## 真实 NULL vs 小计 NULL —— 两种稳健策略 (Day 10)
+- 问题:源数据里**真实为 NULL** 的维度,和 cube/rollup 在小计行上**注入**的
+  NULL,一旦 project 出来就**不可区分**。两条干净的路线,稳健性不同:
+  * **预填哨兵**(所选路线):在 cube **之前** coalesce(dim, '<sentinel>')。
+    彻底消灭源 NULL,于是剩下的每个 NULL 都只可能是小计 NULL。**最稳健**——
+    从根上消除混淆;之后可以**仅凭** grouping_id 重建维度,完全不碰 IS NULL。
+    代价:哨兵字符串可能和真实维值撞车(挑一个不可能出现的值来防)。
+  * **事后判别**(参考路线):保留 NULL,先分支 GROUPING(dim)==1 -> 'ALL',
+    **再** IS NULL -> 哨兵。更"正确"(不改源数据)但**对顺序敏感**:两个分支
+    调换,真实 NULL 和小计 NULL 就并到一起了。这是脆弱的那条路——分支顺序是
+    一个下一个人随手就能破坏的可删除不变量。
+- SUM(int) 上加 cast('long'):SUM(int)->bigint;显式 cast 是给生产 sink 的
+  schema 卫生(check() 两种写法都抓不到)。
 
-## Precise-grain control + conditional count (Day 12)
-- Grain-set selection = pick the RIGHT tool for the EXACT set of grains,
-  not the most powerful one. Wanted {(r,c),(r),(c)} (three non-empty
-  grains, NO grand total):
-  * GROUPING SETS ((r,c),(r),(c)) — names exactly those three, emits no
-    () row, needs no post-filter. The precise-control winner (same
-    "explicit values list" philosophy as Day 3 pivot).
-  * CUBE(r,c) — emits all four incl. grand total (); must filter gid!=3.
-    Over-produces then prunes.
-  * ROLLUP(r,c) — {(r,c),(r),()}: WRONG set — has the () you don't want
-    AND misses (category). Hierarchical assumption r->c doesn't fit a
-    symmetric two-singleton requirement.
-  * DSL has NO grouping_sets: use cube-then-filter (one Expand, one
-    Exchange, computes a 4th grain it throws away) or explicit 3-branch
-    union (3 scans + 3 Exchanges, no wasted grain). On tiny domains
-    either is fine; at scale prefer single-scan grouping sets / cube.
-- Threshold / conditional count trap (the planted trap): big_orders =
-  "# rows with amount>=1000". The else-branch value decides everything:
-  * SUM(when(cond,1).otherwise(0))  -> correct (sums the 1s)
-  * COUNT(when(cond,1))  [NO otherwise] -> correct (else = NULL, COUNT
-    skips NULL)
-  * COUNT(when(cond,1).otherwise(0)) -> WRONG: 0 is non-NULL, COUNT
-    counts EVERY row = group SIZE. Right on a grain where all rows
-    happen to qualify, wrong elsewhere -> coincidentally-correct
-    camouflage (same aggregate-NULL family as COUNT(device.os) Day 7).
-- Rebuild rolled-up dims from grouping metadata ALONE, never `col IS NULL
-  AND gid=k`. The IS NULL conjunct is redundant on clean data and
-  actively misleading: it signals "NULL is part of the判据" when gid
-  (or grouping(col)=1) is the sole root signal. On a genuinely-NULL
-  source dim the IS NULL version can still resolve correctly by luck,
-  but it's a deletable-invariant smell — strip IS NULL, keep gid only.
-- grouping(col) -> 0/1 per row (1 = this col rolled up here). It IS an
-  aggregate, valid only under group by / grouping sets / cube / rollup.
-  grouping_id(c1,...,cn) packs those bits into one int, LEFTMOST arg =
-  HIGH bit: grouping_id(region,category) = grouping(region)*2 +
-  grouping(category)*1. So gid=1 -> (region) grain (category rolled up,
-  fill category='ALL'); gid=2 -> (category) grain (region rolled up,
-  fill region='ALL'). NOTE the cross: the column filled 'ALL' is the
-  ROLLED-UP dim, the level/grain name is the SURVIVING dim — they are
-  opposite by construction (the reason level comments are easy to write
-  backwards). grouping(col)=1 form is self-documenting; grouping_id
-  magic numbers need bit-order recall pinned to ARG order.
+## 精确 grain 控制 + 条件计数 (Day 12)
+- **grain 集合的选择 = 为精确的 grain 集合挑对工具**,而不是挑最强的工具。
+  想要 {(r,c),(r),(c)}(三个非空 grain,**不要**总计):
+  * GROUPING SETS ((r,c),(r),(c)) —— 精确点名这三个,不产生 () 行,不需要
+    后置过滤。精准控制的赢家(同 Day 3 pivot 的"显式 values 列表"哲学)。
+  * CUBE(r,c) —— 连总计 () 一起产生 4 个,必须过滤 gid!=3。先超产再裁剪。
+  * ROLLUP(r,c) —— {(r,c),(r),()}:**集合就是错的**——多了不想要的 (),
+    还**缺了** (category)。r->c 的层级假设不适合"两个对称单维"的需求。
+  * DSL **没有** grouping_sets:用 cube-然后过滤(一个 Expand、一个 Exchange,
+    多算一个用不上的 grain)或显式三分支 union(3 次扫描 + 3 个 Exchange,
+    不浪费 grain)。小数据量两者都行;规模上去优先单次扫描的 grouping sets/cube。
+- **阈值 / 条件计数陷阱**(埋的雷):big_orders = "amount>=1000 的行数"。
+  **else 分支的取值决定一切**:
+  * SUM(when(cond,1).otherwise(0))  -> 正确(把 1 加起来)
+  * COUNT(when(cond,1))  【不写 otherwise】 -> 正确(else 是 NULL,COUNT 跳过)
+  * COUNT(when(cond,1).otherwise(0)) -> **错**:0 是非 NULL,COUNT 数**每一行**
+    = 组的大小。在所有行都满足条件的 grain 上恰好正确,在别的 grain 上错——
+    "碰巧正确"的伪装(和 Day 7 的 COUNT(device.os) 同属聚合-NULL 家族)。
+- 重建被卷起的维度**只用 grouping 元信息**,永远不要写 `col IS NULL AND gid=k`。
+  那个 IS NULL 合取项在干净数据上是冗余的,而且**主动误导**:它暗示"NULL 是
+  判据的一部分",而实际上 gid(或 grouping(col)=1)才是唯一的根信号。即使源维
+  真的有 NULL,带 IS NULL 的版本也可能靠运气得出正确结果,但它是典型的
+  可删除不变量气味——删掉 IS NULL,只留 gid。
+- grouping(col) -> 每行 0/1(1 = 这一列在这里被卷起)。它**是聚合函数**,只在
+  group by / grouping sets / cube / rollup 下合法。grouping_id(c1,...,cn) 把这些
+  位打包成一个整数,**最左参数 = 最高位**:grouping_id(region,category) =
+  grouping(region)*2 + grouping(category)*1。所以 gid=1 -> (region) grain
+  (category 被卷起,填 category='ALL');gid=2 -> (category) grain(region 被卷起,
+  填 region='ALL')。**注意这个交叉**:被填 'ALL' 的是**被卷起**的那一维,而
+  level/grain 的名字来自**幸存**的那一维——两者天生相反(这就是 level 注释很容易
+  写反的原因)。grouping(col)=1 形式自解释;grouping_id 的魔数需要把位序钉死在
+  **参数顺序**上来回忆。
 
-## Date/time: tz bucketing + date-dimension gap-fill (Day 11)
-- Conversion DIRECTION is the whole trap. from_utc_timestamp(ts, tz)
-  reads "ts is a UTC instant, give me the wall-clock time in tz" — the
-  correct direction for "stored in UTC, report in local". to_utc_timestamp
-  is the INVERSE (local->UTC) and shifts the wrong way: an LA sale gets
-  +8h instead of -8h, silently moving it to the next day. The bug PASSES
-  on every row that doesn't straddle local midnight — only day-boundary
-  rows expose it. Same "camouflage on clean rows" family as COUNT(device.os).
-- to_date / cast(date) on a timestamp is evaluated in
-  spark.sql.session.timeZone. You already localized via
-  from_utc_timestamp; if the session tz is non-UTC, to_date re-shifts a
-  SECOND time = double-conversion day-shift. Pin session tz (UTC in the
-  harness) so the date you computed isn't silently re-bucketed.
-- The window filter must be applied on the LOCAL date, AFTER tz
-  conversion — never on the raw UTC date. An out-of-window UTC timestamp
-  can land in-window locally (and vice versa), so filtering ts_utc first
-  drops/keeps the wrong rows. This is the SECOND layer of the tz trap,
-  distinct from the direction bug: right function, wrong axis to filter on.
-- Gap-fill = manufacture a dense SPINE, don't detect gaps. Build the full
-  key x date axis (explode(sequence(start, stop, interval 1 day)) crossJoin
-  the dimension), LEFT join the sparse aggregate onto the spine (spine is
-  the LEFT/preserved side), COALESCE nulls to 0. Dimension-table cousin of
-  Day 2 gaps-and-islands: Day 2 DETECTED gaps via row_number arithmetic;
-  here you build the complete axis so a missing day cannot hide.
-- sequence(start, stop, interval) is INCLUSIVE on BOTH ends; explode turns
-  the array into rows. Narrow generation (no shuffle). Aggregate sales to
-  (store, day) grain BEFORE joining the spine: the join is then
-  spine(small) LEFT agg(small) — never join raw sales to the spine (grain
-  blow-up + needless shuffle), same "aggregate before the wide join"
-  discipline as Day 8's groupBy-branch cost.
-- Zero-fill both measures with correct types: revenue -> 0.0 (double,
-  SUM(double) already double), n_txn -> CAST(0 AS BIGINT) to match COUNT's
-  bigint. The double cast on revenue is redundant (int literal 0 promotes
-  to double under coalesce with a double); the bigint cast on n_txn is the
-  one that actually earns its keep. Redundant-vs-necessary defensive cast,
-  same discriminate-don't-blanket-cast rule as elsewhere.
+## 日期/时间: 时区分桶 + 日期维度补齐 (Day 11)
+- **转换方向就是全部陷阱**。from_utc_timestamp(ts, tz) 读作"ts 是一个 UTC 瞬时,
+  给我它在 tz 的墙钟时间"——这正是"以 UTC 存储、按本地报表"要的方向。
+  to_utc_timestamp 是**反向**(本地->UTC),会朝错误方向平移:一笔 LA 的销售会
+  +8h 而不是 -8h,静默地挪到第二天。这个 bug 在**任何不跨本地午夜的行上都通过**
+  ——只有日界行才暴露。和 COUNT(device.os) 同属"干净行上伪装"家族。
+- 对 timestamp 做 to_date / cast(date) 是在 **spark.sql.session.timeZone** 下求值的。
+  你已经用 from_utc_timestamp 本地化过了;如果 session tz 非 UTC,to_date 会
+  **第二次**平移 = 双重转换的日期漂移。把 session tz 钉死(harness 里用 UTC),
+  让你算出来的日期不被静默地重新分桶。
+- 窗口过滤必须作用在**本地日期**上、在时区转换**之后**——绝不能用原始 UTC 日期。
+  一个 UTC 上看在窗口外的时间戳,本地看可能在窗口内(反之亦然),所以先按 ts_utc
+  过滤会丢错/留错行。这是时区陷阱的**第二层**,和方向 bug 是两回事:函数对了,
+  但过滤的轴错了。
+- **补齐 = 制造一条稠密的 SPINE,而不是去检测缺口**。构造完整的 key x date 轴
+  (explode(sequence(start, stop, interval 1 day)) crossJoin 维表),把稀疏的聚合
+  结果 LEFT join 到 spine 上(spine 是 LEFT/被保留的一侧),再 COALESCE 成 0。
+  这是 Day 2 gaps-and-islands 的维表版:Day 2 用 row_number 算术**检测**缺口;
+  这里是把完整的轴造出来,让缺失的天无处藏身。
+- sequence(start, stop, interval) 两端**都是闭区间**;explode 把数组变成行。
+  窄依赖生成(不产生 shuffle)。**先**把销售聚合到 (store, day) grain **再**去 join
+  spine:那样 join 是 spine(小) LEFT agg(小)——**永远不要**拿原始销售去 join spine
+  (grain 爆炸 + 无谓 shuffle),和 Day 8"宽 join 前先聚合"是同一条纪律。
+- 两个度量的零填充要带正确类型:revenue -> 0.0(double,SUM(double) 本来就是
+  double),n_txn -> CAST(0 AS BIGINT) 以匹配 COUNT 的 bigint。revenue 上的 double
+  cast 是冗余的(int 字面量 0 在与 double 的 coalesce 中会提升);n_txn 上的 bigint
+  cast 才是真正有用的那个。冗余 cast vs 必要 cast,同样遵循"逐个判别、别一刀切"。
 
-## Sessionization & window frames (Day 13)
-- Gap-threshold sessionization = gaps-and-islands with a THRESHOLD
-  instead of strict +1. Day 2's (value - row_number) constant-diff
-  trick DIES here (gap is any value 0..threshold, not a fixed step).
-  General idiom, three moves: lag(prev ts) -> boundary flag
-  (prev IS NULL OR gap > threshold -> 1 else 0) -> running SUM(flag)
-  over ordered window = the island/session key -> groupBy(user, key).
-- The ordered-window default frame (RANGE UNBOUNDED PRECEDING ..
-  CURRENT ROW) that was the Day 8 BUG (accidental running count) is
-  the TOOL here (deliberate running sum of flags). Same mechanism,
-  opposite verdict — judge the frame against INTENT, not by reflex.
-- Threshold direction & unit traps (all coincidentally-correct on
-  clean data, same family as Day 11 tz-direction / Day 7 COUNT):
-  * gap must be current - prev; prev - current is always negative,
-    `> threshold` never fires -> everything collapses to one session.
-  * compare in SECONDS (gap_sec > 1800), NOT truncated minutes.
-    timestamp_diff('MINUTE',...) / int-minute rounding truncates
-    30:40 -> 30, passes `> 30` as false = wrongly merged. Integer-
-    minute boundaries pass on test data, sub-minute gaps expose it.
-  * boundary is STRICTLY greater: gap == 1800s stays SAME session
-    (spec: <= 30 min same). `>= 1800` is off-by-one on the exact-
-    boundary row.
-- Debug discipline for window pipelines: when the running sum looks
-  wrong, .show() the INTERMEDIATE flag column first. A flag column
-  that's all 0 (e.g. when(...).otherwise(0) with BOTH branches 0) is
-  visible in one glance — don't suspect sum-over; it faithfully adds
-  a broken input.
-- session_window built-in vs a lag-written spec: session_window closes
-  at last_ts + gap and merges only if new_ts < that end (STRICT <), and
-  its .end = last event + gap (not the last event's ts). Two contract
-  mismatches with a "gap <= 30 same session, end = last event" spec:
-  the exact-boundary row splits, and every end is shifted +gap. Built-ins
-  carry their OWN contract — match it to the written spec before reaching
-  for them (right tool when the spec IS written in session_window terms,
-  esp. streaming).
+## 会话化与窗口 frame (Day 13)
+- **按间隔阈值做会话切分 = 把 gaps-and-islands 的"严格 +1"换成"阈值"**。
+  Day 2 的 (value - row_number) 常数差技巧在这里**失效**(间隔是 0..threshold
+  之间的任意值,不是固定步长)。通用套路三步:lag(前一个 ts) -> 边界标志
+  (prev IS NULL OR gap > threshold -> 1 否则 0) -> 在有序窗口上做
+  running SUM(flag) = island/session key -> groupBy(user, key)。
+- 那个在 Day 8 是 **BUG** 的有序窗口默认 frame(RANGE UNBOUNDED PRECEDING ..
+  CURRENT ROW,导致意外的累计计数),在这里是**工具**(故意要 flag 的累计和)。
+  同一个机制,相反的结论——**要对着意图判断 frame,不要凭条件反射**。
+- 阈值的方向与单位陷阱(都在干净数据上"碰巧正确",同 Day 11 时区方向 /
+  Day 7 COUNT 家族):
+  * gap 必须是 current - prev;prev - current 恒为负,`> threshold` 永不触发
+    -> 所有事件塌缩成一个 session。
+  * 用**秒**比较(gap_sec > 1800),**不要**用截断后的分钟。
+    timestamp_diff('MINUTE',...) / 整数分钟取整会把 30:40 截成 30,`> 30`
+    判假 = 错误合并。整数分钟的测试数据能通过,亚分钟间隔才暴露。
+  * 边界是**严格大于**:gap == 1800s 仍属**同一** session(规格:<= 30 分钟
+    算同一个)。`>= 1800` 在恰好等于边界的那行上差一位。
+- 窗口流水线的调试纪律:当 running sum 看起来不对时,**先 .show() 中间的 flag
+  列**。一个全 0 的 flag 列(例如 when(...).otherwise(0) 两个分支都是 0)一眼
+  就能看出来——别去怀疑 sum-over,它只是忠实地把一个坏输入加了起来。
+- **内置 session_window vs 用 lag 手写的规格**:session_window 在
+  last_ts + gap 处关闭,只有 new_ts < 该结束点才合并(**严格 <**),且它的 .end
+  = 最后事件 + gap(不是最后事件的 ts)。和"gap <= 30 分钟算同一 session、
+  end = 最后事件"这个规格有**两处契约不匹配**:恰好在边界的那行会被切开,
+  而且每个 end 都平移了 +gap。**内置函数自带它自己的契约**——在伸手去用之前,
+  先把它和写下来的规格对齐(当规格本身就是用 session_window 的语言写的时候
+  它才是对的工具,尤其是流式场景)。
 
-## Window frame mechanics: ROWS vs RANGE, frame-affected vs not
-- Frame is part of the WINDOW SPEC, built on Window/WindowSpec BEFORE
-  .over(): Window.partitionBy(...).orderBy(...).rowsBetween(a,b), THEN
-  fn.over(w). .over() returns a Column and is the CLOSING step —
-  col.over().rowsBetween(...) is AttributeError (Column has no frame
-  method). Frame lives on the window, not the aggregate result. Build
-  order: partitionBy -> orderBy -> rowsBetween/rangeBetween (frame
-  depends on orderBy, so it goes last).
-- ROWS vs RANGE differ ONLY when orderBy has duplicate values (peers):
-  * RANGE bounds by VALUE: all equal-orderBy rows are peers, included
-    together (a peer's frame contains its peers). "Duplicate value" is
-    a meaningful concept to RANGE.
-  * ROWS bounds by physical ROW POSITION: each row is row N, N+1...;
-    duplicates are NOT special — ROWS never pools peers. Cost: which
-    duplicate is "row N" is nondeterministic (orderBy ties unresolved),
-    so a single row's running value can be nondeterministic. Harmless
-    when a downstream groupBy re-collapses the partition (Day 13); pin
-    a tie-break key in orderBy if a specific row's frame value matters.
-  * Day 13 both give the same session key because duplicate ts -> gap 0
-    -> flag 0, so pooled peers contribute 0. Prefer explicit ROWS when
-    peers could carry non-zero value — self-documenting + peer-safe
-    (the "if in doubt, pin ROWS" action).
-- FRAME AFFECTS ONLY frame-sensitive aggregates: sum / count / avg /
-  max / min / collect_list over a window respond to rowsBetween /
-  rangeBetween. Ranking & positional functions — row_number / rank /
-  dense_rank / lag / lead / ntile — IGNORE the frame entirely (their
-  semantics are pure position/rank). So unboundedPreceding & custom
-  frames are used ONLY with the aggregate family; setting a frame on
-  lag/rank is a no-op smell.
+## 窗口 frame 机制: ROWS vs RANGE,以及哪些函数受 frame 影响
+- frame 是 **window spec 的一部分**,在 .over() **之前**构建在
+  Window/WindowSpec 上:Window.partitionBy(...).orderBy(...).rowsBetween(a,b),
+  **然后**才 fn.over(w)。.over() 返回的是 Column,是**收尾**步骤——
+  col.over().rowsBetween(...) 是 AttributeError(Column 没有 frame 方法)。
+  frame 属于窗口,不属于聚合结果。构建顺序:partitionBy -> orderBy ->
+  rowsBetween/rangeBetween(frame 依赖 orderBy,所以放最后)。
+- **WindowSpec 是不可变的**:.rangeBetween(...) 返回新对象而不是原地修改。
+  所以一旦 base spec 用某个 orderBy 建好,由它派生出的所有 spec 都继承那个
+  orderBy——改列不改 spec 是没用的(Day 15 实际踩到:加了 day_num 列但
+  base spec 仍按 sale_date 排序)。
+- ROWS 和 RANGE **只在 orderBy 有重复值(peers)时**才有区别:
+  * RANGE 按**值**界定:所有 orderBy 相等的行互为 peer,被一起纳入
+    (一个 peer 的 frame 包含它的所有 peer)。"重复值"对 RANGE 是有意义的概念。
+  * ROWS 按**物理行位置**界定:每行就是第 N、N+1 行;重复值毫无特殊性,
+    ROWS **永不**把 peer 归堆。代价:哪个重复行是"第 N 行"是不确定的
+    (orderBy 的并列没被解开),所以单行的累计值可能不确定。当下游有 groupBy
+    把分区重新塌缩时无害(Day 13);如果某一行的 frame 值本身重要,就在
+    orderBy 里钉一个 tie-break 键。
+  * Day 13 两者给出相同 session key,是因为重复 ts -> gap 0 -> flag 0,所以
+    被归堆的 peer 贡献 0。当 peer 可能带非零值时优先显式用 ROWS——自解释且
+    对 peer 安全("拿不准就钉 ROWS")。
+- **frame 只影响对 frame 敏感的聚合**:窗口上的 sum / count / avg / max / min /
+  collect_list 会响应 rowsBetween / rangeBetween。排名与位置函数——row_number /
+  rank / dense_rank / lag / lead / ntile——**完全忽略** frame(它们的语义纯粹是
+  位置/名次)。所以 unboundedPreceding 和自定义 frame **只**和聚合函数家族一起用;
+  给 lag/rank 设 frame 是 no-op,是一种气味。
 
-## rangeBetween units + unboundedPreceding intent (Day 13)
-- rangeBetween(start,end) bounds take INTEGERS interpreted against the
-  orderBy column's type — NOT an interval Column. On a DATE orderBy the
-  int is DAYS: rangeBetween(-6, currentRow) = "last 6 days", pure DSL,
-  no expr. On a TIMESTAMP orderBy the int is SECONDS:
-  rangeBetween(-6*86400, currentRow) for 6 days. Same integer means a
-  different span on date vs timestamp — a 6-on-timestamp is a 6-SECOND
-  window (unit trap, Day 11 family). Only the `INTERVAL 6 DAYS PRECEDING`
-  literal syntax forces expr / raw SQL; the second-count stays pure DSL.
-- unboundedPreceding = frame START pinned to the PARTITION's first row
-  (per partitionBy, reset at each new partition key; "first" = earliest
-  under orderBy), NEVER sliding, NEVER crossing the partition boundary.
-  Choose by ONE question — does the start SLIDE with the current row?
-  * No, fixed at partition head -> unboundedPreceding = CUMULATIVE
-    (running total, cumulative max/min).
-  * Yes, follows current row -> finite offset rowsBetween(-N,..) /
-    rangeBetween(-secs,..) = SLIDING (moving average, last-6-days).
-  * unboundedPreceding + unboundedFollowing = WHOLE partition (total,
-    e.g. denominator for a cumulative-share ratio) = the partitionBy-
-    only no-orderBy "true total" frame (Day 8).
+## RANGE frame 的类型约束 (Day 15,实测修正 Day 13 的旧记录)
+- **旧记录是错的**,已在 Spark 4.2.0 实测推翻:04 曾写"DATE orderBy 上整数就是
+  天,纯 DSL 无需 expr"、"TIMESTAMP orderBy 上整数是秒"。**在 PySpark 里这两条
+  都跑不通**,报 DATATYPE_MISMATCH.RANGE_FRAME_INVALID_TYPE:
+  `The data type "DATE" used in the order specification does not support the
+  data type "BIGINT" which is used in the range frame`。
+- **根因**:Catalyst 对 range frame 的类型规则里,DATE 排序列只接受
+  IntegerType(及 interval 类型)的边界。SQL 里字面量 6 解析成 INT,所以 SQL
+  走得通;而 PySpark 的 rangeBetween 把 Python int 交给 JVM 后落成 **BIGINT**
+  字面量,DATE+BIGINT 不在白名单。而且 frame 边界的类型强制**只做 up-cast**,
+  BIGINT->INT 是窄化,不会自动补 cast -> **分析期**就失败(连物理计划都没生成)。
+- **触发条件收得更准**:类型检查**只由有限数值边界触发**。
+  unboundedPreceding / unboundedFollowing / currentRow 在 Catalyst 里是
+  **SpecialFrameBoundary**——符号,不带数据类型,压根不进这条校验。
+  **两个边界都是符号 -> 安全;任意一个是有限数值偏移 -> 触发,DATE 上就挂。**
+  一个就够。实测(DATE 排序列):
+  * range(unboundedPreceding, currentRow)        OK
+  * range(unboundedPreceding, unboundedFollowing) OK
+  * range(currentRow, unboundedFollowing)         OK
+  * range(0, 0)                                   OK
+  * range(unboundedPreceding, -1)                 **FAIL**
+  * range(-6, unboundedFollowing)                 **FAIL**
+  * rowsBetween(任意整数)                          OK(ROWS 数行位置,与排序列
+    类型无关)
+  * 默认 frame(只写 orderBy)                      OK
+- 实现细节:Window.currentRow 的值就是 **0**,unboundedPreceding 是 -2^63;
+  PySpark 把这些哨兵值映射回符号边界。所以 rangeBetween(-6, 0) 里的 0 **早就是
+  符号**了——你以为写了两个数字,其实只有 -6 是真的数值边界。报错里的
+  `specifiedwindowframe(RangeFrame, -6, currentrow$())` 正好印证:左边是裸数字
+  (BIGINT 字面量),右边是 currentrow$()(符号,无类型)。
+- **DSL 的修法**:把排序列换成数值型的"天序号":
+  `F.datediff("sale_date", F.lit(date(1970,1,1))).cast("long")`,或内置的
+  `F.unix_date("sale_date")`(3.1+,返回 epoch 天数);INT/BIGINT 都能过。
+  加这一列是窄投影,**不产生 shuffle**——实测整个查询仍然只有一个 Exchange,
+  两个 window 共用同一次 hashpartitioning + 同一次 Sort。
+  **不要**走"转 timestamp 再 cast long"那条路当日粒度用——那是**秒**,-6 会
+  变成 6 秒(单位陷阱)。
+- **SQL 那半边不用改**:`ORDER BY sale_date RANGE BETWEEN 6 PRECEDING AND
+  CURRENT ROW` 直接可用。`INTERVAL 6 DAYS PRECEDING` 这种形式**只存在于 SQL 的
+  frame 子句**里,`F.expr("INTERVAL 6 DAYS PRECEDING")` 不是合法表达式
+  (PRECEDING 是 frame 语法关键字,不属于表达式语法),rangeBetween 也不收
+  Column 类型的边界——传 Column 进去会在参数归一化时撞
+  CANNOT_CONVERT_COLUMN_INTO_BOOL。
+- **不要用数仓里常见的 date_key(yyyymmdd 整数)当 RANGE 排序列**:类型上过得去,
+  但算术是错的(20260601 - 6 = 20260595,不是 5 月 26 日),跨月边界静默算错、
+  月中完全正确——又一个"碰巧正确"的坑。RANGE 排序列必须是**均匀刻度**的
+  (epoch 天 / epoch 秒),不能是编码型整数。
 
-## Python UDFs: registration, serialization, cost (Day 14)
-- returnType is MANDATORY in practice: omitting it defaults to
-  StringType(), so an int-producing UDF silently yields STRINGS and the
-  tuple compare fails on TYPE, not value. Always `@F.udf(IntegerType())`.
-- A UDF is NOT NULL-aware. NULL arrives as Python None and the body runs
-  anyway — no short-circuit, no free propagation. Native expressions
-  propagate NULL for you; a UDF must defend explicitly or raise inside
-  the executor.
-- Decorator order for a class-hosted UDF: @staticmethod OUTERMOST,
-  @F.udf inner. Reversed, F.udf wraps a staticmethod DESCRIPTOR rather
-  than a function (uncallable pre-3.10). Static matters for
-  SERIALIZATION: an instance method drags `self`, so the whole object is
-  pickled to the executor and any unpicklable member (e.g. a
-  SparkSession ref) is a PicklingError. Module-level functions are the
-  smallest-scope default; class-hosted is fine but must be justifiable
-  as static in review.
-- @F.udf registers for DSL ONLY. Calling it from SQL without
-  spark.udf.register raises UNRESOLVED_ROUTINE. Two registration shapes:
-  * register(name, udf_object)        -> returnType comes FROM the UDF
-  * register(name, fn.func, retType)  -> `.func` unwraps to the raw
-    Python function, so retType is now REQUIRED
-  Passing BOTH a UDF object and a returnType raises
-  CANNOT_SPECIFY_RETURN_TYPE_FOR_UDF (Spark refuses to arbitrate two
-  return types). register() also RETURNS a usable UDF object, so one
-  call can serve both DSL and SQL. Registration scope = the current
-  SparkSession only; the SQL name need not match the Python name.
-- Cost model: BatchEvalPython serializes rows out to a Python worker and
-  back (pickle round trip), is an OPTIMIZER BARRIER (no pushdown
-  through it, no constant folding), and blocks whole-stage codegen for
-  that column. pandas_udf -> ArrowEvalPython: vectorized batches, far
-  less per-row overhead, same optimizer opacity. Rule: reach for a UDF
-  only when NO native expression exists — here str_to_map / split /
-  size / element_at cover the entire task natively.
+## 稀疏时间序列上的移动平均 (Day 15)
+- **"前一行"和"前一天"在稀疏表上是两个概念**,这是整题的题眼。表是稀疏的
+  (不营业的日子**没有行**,不是有一行 0),所以:
+  * ROWS frame / lag(n) 数的是**物理行**,缺口之后会伸得太远。
+  * RANGE frame 按 orderBy 的**值**界定,才等于"最近 7 个日历日"。
+  * 这个 bug 在**连续**数据上两者完全一致——只有缺口旁边的行分叉
+    (Day 15 的 10 行里只有 3 行会暴露)。同 Day 11 时区方向 / Day 13 间隔方向
+    的伪装家族。
+- **frame 也可以当"按值查找"用**:rangeBetween(-1, -1) 就是"前一个日历日",
+  两个边界钉在同一个偏移上,frame 从"滑动区间"退化成"点查"。
+  空 frame -> 聚合返回 **NULL,不是 0**,所以外面的 COALESCE 是**有实际作用**的
+  (和那些被聚合-NULL 规则判为冗余的防御性 COALESCE 不是一回事)。
+- lag **没有 frame 可以修**(位置函数忽略 frame),所以稀疏数据上要么用
+  range-framed 聚合,要么先补齐日期轴,**绝不是**给 lag 加 frame。
+  lag 的第三个参数 default **也不是**给缺口用的:它只在分区头部(真的没有前
+  一行)生效;缺口之后前一行是存在的,default 不触发,你拿到的是几天前的值
+  ——这个误用在首行上表现完全正确,很隐蔽。
+- 用 lag 走通的正确写法是**把日期也 lag 出来自己校验**:
+  lag(sale_date) 后判断 datediff(sale_date, prev_date) == 1。分区首行的
+  prev_date 是 NULL -> datediff 返回 NULL -> when 条件不成立 -> 走 otherwise,
+  所以**不需要**再加 isNotNull(那是冗余防御代码)。保留意见:那个
+  `datediff == 1` 是可删除的不变量,下一个人看到"lag 已经取到前一行了"很容易
+  把校验删掉,而测试在连续数据上照样绿。**正确性写在窗口规格里,优于写在一个
+  if 里。**
+- **AVG over 稀疏 RANGE frame 的分母是数据属性,不是常量**。frame 决定的是
+  "哪些行进来",而 avg 的分母是"进来了几行"——这是行数概念,不是值区间概念。
+  拆开看:SUM 对缺行**免疫**(缺一行 = 加 0,与"有一行 0"结果相同);
+  AVG/COUNT 对缺行**不免疫**(它们靠数行数活着)。所以"分母恒为 7 个日历日"
+  只能自己写 sum/7,frame 帮不上忙。语义上这是两个都合法的指标:
+  sum/7 = 每个**日历日**平均营收(含歇业日);avg = 每个**营业日**平均营收。
+  推论:如果先补齐日期轴让表变稠密,avg 就变成对的了——**avg 的正确性取决于
+  表的稠密度**,这与 ROWS/RANGE 之争是同一件事的两面。这条是聚合-NULL 规则的
+  同族:聚合忽略 NULL,同样也忽略"不存在的行";对 SUM 无害,对 AVG/COUNT 就是
+  静默改语义。
+- 除法要**显式**守卫(WHEN prev > 0),不要指望 x/0 返回 NULL:只有 ANSI 关闭时
+  Spark 才返回 NULL,ANSI 打开会抛 DIVIDE_BY_ZERO(同 Day 14 规则——来自失败
+  路径的 NULL 是 session 配置,不是语言保证)。
+- 成本:**一个 partitionBy 表达式 = 一个 Exchange**,无论上面挂多少个不同 frame
+  的 window,它们共用同一个 Exchange 和同一次 Sort。frame 是在已排好序的分区
+  内部求值的,不额外收费。用 .explain() 数 Exchange 确认。
+- **同一份解法里,一个 COALESCE 是承重的,另一个是死代码**(Day 15 AI review):
+  * prev 那个 rangeBetween(-1,-1) 的 frame **可能为空**(前一天没有行)->
+    sum 返回 NULL -> COALESCE **承重**。
+  * ma7 那个 rangeBetween(-6, currentRow) 的 frame **永远至少包含当前行**
+    (currentRow 是边界之一,而当前行必然存在;revenue 按规格非 NULL)->
+    sum 永不为 NULL -> COALESCE 是**死代码**。
+  判据不是"这是个聚合所以可能 NULL",而是**这个 frame 能不能为空**:
+  边界含 currentRow -> 至少一行 -> 非空;两端都是有限偏移且不含当前行
+  (如 (-1,-1))-> 可能为空。这是聚合-NULL 规则在 **frame 维度**上的细化。
+- 内置函数优先:把日期转成天序号,`F.unix_date(col)`(3.1+)就是干这个的,
+  手写 `datediff(col, lit('1970-01-01'))` 是同一件事的手搓版(SQL 侧对应
+  `unix_date(sale_date)`)。功能上等价、代价相同,但它是 Day 14
+  "有格式/专用内置函数却手搓"那条启发式在日期家族里的又一次触发。
+  (顺带:epoch 这个锚点是任意的——同一分区内只有**差值**有意义,
+  换成任何固定日期结果都一样;这也说明它本质上就是"给我一个均匀刻度的整数轴"
+  这个内置语义。)
 
-## String splitting exactness (Day 14)
-- `"".split("&")` returns `[""]` — length 1, NOT 0. An empty payload must
-  be intercepted BEFORE split; you cannot let len(split(...)) compute
-  n_params. Contrast the no-arg form: `"".split()` returns `[]`.
-  Different behaviour for the same method name — easy to conflate.
-- `"nosep".split("&")` returns `["nosep"]` — one element, never an error
-  and never an empty list. Single-param payloads need no special case;
-  only the empty string does.
-- Regex quantifier direction is the empty-value trap: `tier=([^&]+)`
-  requires >=1 char, so `tier=` does NOT match and falls through to the
-  'UNKNOWN' branch — but the spec reserved 'UNKNOWN' for an ABSENT key.
-  `+` -> `*` matches the empty value and group(1) is "".
-- Unanchored key regex mis-matches SUFFIXES: `tier=` matches inside
-  `user_tier=gold`. Anchor with `(?:^|&)tier=([^&]*)`, or drop regex for
-  split('&') + partition('=') and compare the key EXACTLY — the latter
-  reads better in review and eliminates the whole boundary bug class.
-- `split(str, sep, limit)`: the third arg is the SQL cousin of Python's
-  str.partition. limit=2 keeps a value that contains the separator
-  intact ("a=b=c" -> ["a", "b=c"]).
+## Python UDF: 注册、序列化、成本 (Day 14)
+- returnType 在实践中是**必填**:省略会默认成 StringType(),于是一个产出 int 的
+  UDF 静默返回**字符串**,tuple 比较挂在**类型**上而不是值上。永远写
+  `@F.udf(IntegerType())`。
+- UDF **不感知 NULL**。NULL 以 Python None 的形式进来,函数体照样执行——不短路、
+  不自动传播。原生表达式会替你传播 NULL;UDF 必须显式防御,否则在 executor 里抛异常。
+- 类内 UDF 的装饰器顺序:@staticmethod 在**外**,@F.udf 在**内**。反过来 F.udf
+  包住的是 staticmethod **描述符**而不是函数(3.10 之前不可调用)。static 对
+  **序列化**很关键:实例方法会拖着 self,导致整个对象被 pickle 到 executor,
+  任何不可 pickle 的成员(如一个 SparkSession 引用)都会引发 PicklingError。
+  模块级函数是作用域最小的默认选择;类内也可以,但必须在 review 中说得通它是 static。
+- @F.udf **只**注册给 DSL。不经 spark.udf.register 就在 SQL 里调用会抛
+  UNRESOLVED_ROUTINE。两种注册形态:
+  * register(name, udf_object)        -> returnType **来自** UDF 对象
+  * register(name, fn.func, retType)  -> `.func` 剥回原始 Python 函数,
+    所以此时 retType **必填**
+  同时传 UDF 对象**和** returnType 会抛 CANNOT_SPECIFY_RETURN_TYPE_FOR_UDF
+  (Spark 拒绝在两个返回类型之间做仲裁)。register() 本身**也返回**一个可用的
+  UDF 对象,所以一次调用可以同时服务 DSL 和 SQL。注册作用域 = 当前 SparkSession;
+  SQL 名字不必和 Python 名字相同。
+- 成本模型:BatchEvalPython 把行序列化到 Python worker 再传回(pickle 往返),
+  是**优化器屏障**(谓词无法下推穿过它、不做常量折叠),并且让该列无法参与
+  whole-stage codegen。pandas_udf -> ArrowEvalPython:向量化批处理,每行开销
+  低得多,但对优化器同样不透明。规则:**只有在没有任何原生表达式可用时**才伸手
+  去写 UDF——Day 14 那题里 str_to_map / split / size / element_at 原生就能全覆盖。
 
-## Higher-order array functions — when transform is the right tool (Day 14)
-- Family and Python analogues: transform ~ map() (array -> equal-length
-  array); filter ~ filter() (array -> shorter array); aggregate ~
-  reduce() (array -> scalar); exists / forall ~ any() / all() (array ->
-  boolean); zip_with ~ zip()+map(); transform_keys / transform_values
-  for maps.
-- Core value: element-wise work AT ARRAY GRAIN without exploding — the
-  same no-explode discipline as Day 4, avoiding the
-  explode -> process -> collect_list round trip.
-- Decision order, in this sequence:
-  1. Is there a dedicated built-in? -> use it (str_to_map, array_distinct,
-     array_sort, array_max, array_contains). Do NOT hand-roll.
-  2. Does the grain need to change (one element -> one row)? -> explode.
-  3. Neither, and the array shape must survive -> transform / filter.
-- Anti-patterns: transform used to reduce to a scalar (use aggregate /
-  array_max); transform-to-booleans followed by array_contains(true)
-  (use exists); transform on a string you just split when a
-  format-specific built-in parses the whole thing.
-- The precondition the AI missed: higher-order functions fit when the
-  array IS the column's natural form. Manually splitting a STRING into
-  an array in order to reach for transform is the tell that a parsing
-  built-in was skipped.
-- Index-base mismatch inside one expression: array subscript arr[i] is
-  0-BASED, element_at(arr, i) is 1-BASED. Mixing `kv[0]` and
-  `element_at(..., 1)` in a single expression is legal and passes, but
-  it is a genuine readability defect in review.
+## 字符串切分的精确行为 (Day 14)
+- `"".split("&")` 返回 `[""]`——长度 **1,不是 0**。空 payload 必须在 split
+  **之前**拦截,不能靠 len(split(...)) 去算 n_params。对比无参形式:
+  `"".split()` 返回 `[]`。同一个方法名两种行为,极易混淆。
+- `"nosep".split("&")` 返回 `["nosep"]`——一个元素,永不报错也永不返回空列表。
+  单参数的 payload 不需要特判;**只有空字符串需要**。
+- 正则量词方向是空值陷阱:`tier=([^&]+)` 要求 >=1 个字符,所以 `tier=`
+  **匹配不上**,落到 'UNKNOWN' 分支——但规格里 'UNKNOWN' 是留给"键**缺失**"的。
+  `+` -> `*` 才能匹配空值,group(1) 得到 ""。
+- 未锚定的键正则会**误匹配后缀**:`tier=` 会在 `user_tier=gold` 内部匹配上。
+  用 `(?:^|&)tier=([^&]*)` 锚定,或干脆放弃正则,改用 split('&') + partition('=')
+  再**精确**比较键——后者在 review 中更好读,而且整类边界 bug 直接消失。
+- `split(str, sep, limit)`:第三个参数是 Python str.partition 的 SQL 表亲。
+  limit=2 能让含分隔符的值保持完整("a=b=c" -> ["a", "b=c"])。
 
-## ANSI mode governs out-of-bounds / failure behaviour (Day 14)
-- element_at, array subscript arr[i], cast, division by zero, arithmetic
-  overflow: under spark.sql.ansi.enabled these THROW; with ANSI off they
-  silently return NULL. ANSI defaults ON in Spark 4.x and off in 3.x, so
-  identical SQL changes FAILURE CLASS across versions and sessions.
-- Therefore any `COALESCE(risky_expr, fallback)` carries a hidden
-  assumption that risky_expr YIELDS a NULL. Under ANSI it never gets the
-  chance — the job dies before COALESCE runs. The AI's
-  COALESCE(UPPER(element_at(filter(...), 1)[1]), 'UNKNOWN') failed
-  exactly this way on rows with no `tier` key: filter -> empty array,
-  element_at(empty, 1) -> ArrayIndexOutOfBoundsException.
-- The try_* family is the explicit way to REQUEST NULL semantics:
-  try_element_at / try_cast / try_divide / try_add / try_subtract /
-  try_multiply / try_sum / try_avg. Config-independent by construction —
-  the fallback pattern only becomes true once the inner call is a try_*.
-- MAP access is NOT in this family: props['missing_key'] returns NULL
-  even under ANSI (the Day 6 rule still holds). One more reason the
-  str_to_map route never had this bug — the hand-rolled array route
-  MANUFACTURED a failure mode that the built-in cannot have.
-- `size(kv) = 2 AND kv[0] = 'tier'` guarding a subscript via AND
-  short-circuit is LUCK, not contract: SQL does not guarantee AND
-  evaluation order. Catalyst usually short-circuits; never build safety
-  on it. Use try_element_at, or a built-in that cannot go out of bounds.
+## 高阶数组函数: transform 什么时候才是对的工具 (Day 14)
+- 家族与 Python 对应:transform ~ map()(数组 -> 等长数组);filter ~ filter()
+  (数组 -> 更短的数组);aggregate ~ reduce()(数组 -> 标量);exists / forall ~
+  any() / all()(数组 -> 布尔);zip_with ~ zip()+map();map 用
+  transform_keys / transform_values。
+- 核心价值:**在数组 grain 上做逐元素处理而不用 explode**——和 Day 4 的
+  "不 explode"纪律相同,避免 explode -> 处理 -> collect_list 的往返。
+- 决策顺序,严格按此:
+  1. 有没有专用内置函数? -> 用它(str_to_map, array_distinct, array_sort,
+     array_max, array_contains)。**不要手搓**。
+  2. grain 需要改变吗(一个元素 -> 一行)? -> explode。
+  3. 都不是,而且数组形状必须保留 -> transform / filter。
+- 反模式:用 transform 去归约成标量(该用 aggregate / array_max);
+  transform 成布尔数组再 array_contains(true)(该用 exists);
+  对一个刚 split 出来的字符串用 transform,而其实有格式专用内置函数能一把解析。
+- AI 漏掉的前提:高阶函数适用于**数组本来就是这一列的自然形态**的场合。
+  为了能用 transform 而手动把**字符串** split 成数组,本身就是"跳过了解析型
+  内置函数"的信号。
+- 同一个表达式内的**下标基准不一致**:数组下标 arr[i] 是 **0-based**,
+  element_at(arr, i) 是 **1-based**。在一个表达式里混用 `kv[0]` 和
+  `element_at(..., 1)` 合法且能跑通,但在 review 中是实打实的可读性缺陷。
 
-## Physical plans / explain()
-- Read bottom-up; key nodes: Scan (source + stats quality), Exchange
-  (= one shuffle each, the cost driver), join node (strategy +
-  BuildLeft/Right side), HashAggregate pairs (partial/final =
-  map-side pre-aggregation working).
-- AdaptiveSparkPlan isFinalPlan=false means pre-execution static plan;
-  trigger an action on the SAME DataFrame object, then explain() again
-  for the AQE final plan (Initial vs Final diff = AQE's runtime
-  decisions: join conversion, AQEShuffleRead coalesced partitions).
-- Optimizer inserts operators you didn't write (isnotnull filter on
-  the null-rejecting side of joins, column-pruning Projects).
-- Shuffle-producing ops: groupBy/distinct/dropDuplicates (with partial
-  agg relief), non-broadcast joins (both sides), Window.partitionBy,
-  orderBy, repartition, intersect/except. Narrow (no shuffle):
-  select/filter/withColumn/explode/union/coalesce(shrink).
-- Same partitioning can be reused (ENSURE_REQUIREMENTS) only when the
-  partition expressions MATCH; subset/superset keys still re-shuffle.
+## ANSI 模式决定"越界/失败"的行为 (Day 14)
+- element_at、数组下标 arr[i]、cast、除零、算术溢出:在
+  spark.sql.ansi.enabled 下会**抛异常**;ANSI 关闭时静默返回 **NULL**。
+  ANSI 在 Spark 4.x **默认开启**、3.x 默认关闭,所以同一段 SQL 在不同版本/会话
+  之间**失败类别**会变。
+- 因此任何 `COALESCE(risky_expr, fallback)` 都携带一个隐含假设:risky_expr 会
+  **产出 NULL**。在 ANSI 下它根本没有机会——作业在 COALESCE 执行之前就死了。
+  AI 写的 COALESCE(UPPER(element_at(filter(...), 1)[1]), 'UNKNOWN') 就是这样在
+  没有 tier 键的行上炸掉的:filter -> 空数组,element_at(空, 1) ->
+  ArrayIndexOutOfBoundsException。
+- **try_\* 家族是显式索要 NULL 语义的方式**:try_element_at / try_cast /
+  try_divide / try_add / try_subtract / try_multiply / try_sum / try_avg。
+  它们按构造就与配置无关——**只有内层换成 try_\* 之后,fallback 模式才成立**。
+- MAP 取值**不属于**这个家族:props['missing_key'] 即使在 ANSI 下也返回 NULL
+  (Day 6 的规则仍然成立)。这也是 str_to_map 路线永远不会有这个 bug 的又一个
+  原因——手搓的数组路线**制造**了一个内置函数根本不可能有的失败模式。
+- 用 `size(kv) = 2 AND kv[0] = 'tier'` 靠 AND 短路来保护下标访问是**运气,不是
+  契约**:SQL 不保证 AND 的求值顺序。Catalyst 通常会短路,但**永远不要**把安全
+  建立在它上面。用 try_element_at,或用一个根本不可能越界的内置函数。
 
-## API style conventions
-- Pure column references (select/groupBy/on) -> plain strings; F.col()
-  when the column participates in expressions (comparison, arithmetic,
-  .desc()/.alias()/.cast(), when()), when referencing a column created
-  mid-chain, alias-qualified names ("t.col"), or programmatic column
-  generation. df["col"] (bound) for self-join disambiguation.
-- DATE_SUB(date, int_col) over date - int (portability: MySQL/Hive
-  differ); F.date_sub accepts Column only on Spark 3.3+.
-- try_cast only for genuinely dirty data; plain cast states intent.
-- cast("int") after count/sum: schema hygiene for production sinks
-  (count returns BIGINT); tests won't catch it either way.
-- LATERAL VIEW OUTER EXPLODE (Hive style, max compatibility) vs
-  modern LATERAL explode_outer(...) — both fine in Spark 3.x.
+## 物理计划 / explain()
+- **自下而上**读;关键节点:Scan(数据源 + 统计信息质量)、Exchange
+  (**每个 = 一次 shuffle**,成本主因)、join 节点(策略 + BuildLeft/Right 侧)、
+  HashAggregate 对(partial/final = map 端预聚合在起作用)。
+- AdaptiveSparkPlan isFinalPlan=false 表示这是执行前的静态计划;对**同一个**
+  DataFrame 对象触发一次 action,再 explain() 才能看到 AQE 的最终计划
+  (Initial vs Final 的差异 = AQE 的运行时决策:join 转换、AQEShuffleRead 合并
+  分区)。
+- 优化器会插入你没写的算子(join 的 null-rejecting 侧上的 isnotnull 过滤、
+  列裁剪的 Project)。
+- 产生 shuffle 的算子:groupBy/distinct/dropDuplicates(有 partial agg 缓解)、
+  非 broadcast join(两侧)、Window.partitionBy、orderBy、repartition、
+  intersect/except。窄依赖(无 shuffle):select/filter/withColumn/explode/
+  union/coalesce(缩小)。
+- 相同分区只有在**分区表达式完全匹配**时才能复用(ENSURE_REQUIREMENTS);
+  子集/超集 key 仍然要重新 shuffle。
+- **窗口相关的 AnalysisException 先读 plan 片段,不要只读错误文案**:报错自带
+  的 logical plan 里 `windowspecdefinition(...)` 直接告诉你窗口**实际**按什么排序、
+  frame **实际**是什么,比文案准得多(Day 15:文案说"DATE 不支持 BIGINT",
+  plan 才显示出窗口仍按 sale_date 排序、day_num 白加了)。
 
-## Review heuristics (accumulated)
-- In unusual contexts (pivot agg, custom agg), distrust star/wildcard
-  expressions — resolution paths differ.
-- The aggregate-NULL rule prunes defensive code in BOTH directions.
-- When explain() contradicts expectations, check the Scan node type
-  first — statistics availability explains half of optimizer behavior.
-- Column-order of output matters to positional tests; a select that
-  reorders is a silent contract change for downstream consumers.
-- Verify performance claims by counting Exchange nodes, not from
-  memory.
-- "Fewer shuffles" is a tempting but often-wrong perf story: when two
-  routes have the SAME Exchange count, the real difference is the
-  WEIGHT of each stage (partial-aggregatable aggregate vs full sort).
-  Name the actual mechanism, don't assert a shuffle-count delta.
-- A COUNT that isn't the count you think: COUNT(field) means "rows
-  where field is non-NULL", which silently equals the wrong metric
-  when the non-NULL set coincides with your intended set on clean data
-  (COUNT(device.os) == mobile_events only because test rows' non-null
-  os were all mobile). Re-derive what each COUNT actually counts from
-  its argument's NULL behavior, per definition.
-- Coincidentally-correct output is camouflage: a wrong-level dedup can
-  produce the right number on some groups (user 1's three distinct
-  key-arrays = three distinct keys). Verify the MECHANISM per edge-case
-  row, not just the final numbers.
-- Misleading column names survive tests but not code review: a column
-  holding all property keys named "devices" is a contract lie to
-  downstream readers.
-- Negated existence in SQL: reach for NOT EXISTS / LEFT ANTI by default,
-  not NOT IN. NOT IN needs BOTH sides NULL-free; the isNotNull patch is
-  deletable by the next editor. Reserve NOT IN for constant lists or
-  when three-valued NULL-poisoning is genuinely intended.
-- "distinct before a join" smell: if the join is semi/anti, the distinct
-  is always redundant (existence ignores multiplicity). If it's inner,
-  the distinct may be compensating for a grain change the join
-  shouldn't have caused — consider semi instead.
-- Edge-case sample in the prompt is a CONTRACT, not decoration: Day 10's
-  single real-NULL-region example row WAS the whole trap. The AI solution
-  handled subtotal-NULL correctly but never surfaced the real NULL —
-  it treated the lone example row as illustration, not as a first-class
-  requirement. When a problem shows exactly one row exercising an edge
-  case, promote it to a must-handle case before reading any solution.
-- GROUPING_ID magic numbers (isin(2,3)) hide a bit-order assumption:
-  gid.isin(2,3) == "region rolled up" is only true if region is the
-  leftmost (high) arg to grouping_id. The per-column grouping() form is
-  more verbose but needs no bit-order recall — prefer it in shared code,
-  reserve grouping_id for many-dim single-CASE level mapping. Either way,
-  the value->meaning map must be pinned to the ARG ORDER, not column
-  order in the table.
-- "Which NULL is this" on the aggregation axis: after any cube/rollup/
-  grouping-sets, a NULL in a grouping column is ambiguous by default.
-  Either pre-fill a sentinel before the aggregation (root fix) or gate
-  every dim reconstruction on GROUPING()==1 first — never rebuild a dim
-  from `IS NULL` alone in a grouping-sets result.
-- HAVING that is secretly a WHERE (Day 11): filtering on a GROUP BY key
-  in HAVING happens to equal WHERE only because the predicate touches a
-  group key, not an aggregate. It PASSES but is a smell — it relies on
-  "the filter column is a grouping key" and forfeits predicate pushdown
-  to before the aggregate. Row-level predicates belong in WHERE; reserve
-  HAVING for conditions on aggregate results. Catch it by reading: ask
-  "is this predicate over a raw column or an aggregate?" — raw column in
-  HAVING = should be WHERE.
-- spark.range vs explode(sequence) for a small fixed axis is NOT a
-  cheap/expensive story (Day 11 corrected a misconception). Neither is a
-  shuffle; range is narrow too. The real difference: sequence is a
-  compile-time constant array (matches the intent of a known date domain,
-  and its crossJoin reliably degrades to a broadcast/nested-loop with ~0
-  Exchange), while range yields a partitioned dataset that MAY introduce
-  a tiny extra exchange at the crossJoin. On a 7-row axis both are
-  effectively free. Argue it as "constant-domain intent + broadcast
-  stability", verified by counting Exchange in .explain() — never as a
-  memorized "range is expensive".
-- API hallucination — the plausible-but-nonexistent DSL function (Day 12):
-  the AI wrote F.grouping_sets([...], "region", "category") in DSL. It
-  does NOT exist — not in 3.x, not even in Spark 4.2 (AttributeError at
-  runtime, whole job dies). The name is dangerous precisely because it
-  mirrors the real SQL `GROUP BY GROUPING SETS` clause, so it reads as
-  obviously-correct. Real DSL has df.cube / df.rollup + F.grouping /
-  F.grouping_id, but NO grouping_sets helper. Review heuristic: for any
-  F.* / df.* call you haven't personally used, "the name matches a SQL
-  keyword" is NOT evidence it exists as a Python API — verify (dir(F),
-  docs, a scratch run) before trusting. Symmetry with SQL is a lure, not
-  a guarantee.
-- IS NULL riding along with a grouping bit (Day 12): `WHEN col IS NULL
-  AND gid=k THEN 'ALL'` passes on clean data but is a smell — gid (or
-  grouping(col)=1) is the SOLE root判据; the IS NULL conjunct is
-  redundant and tells the next editor NULL is part of the decision. Strip
-  it to `WHEN gid=k` (or `WHEN grouping(col)=1`). Companion to the Day 10
-  "never rebuild a dim from IS NULL alone" — here the failure mode is the
-  opposite direction (IS NULL present but superfluous), same fix: gid only.
-- Frame set on a ranking/positional function is a no-op smell (Day 13):
-  if you see rowsBetween / rangeBetween attached to row_number / rank /
-  dense_rank / lag / lead / ntile, the author likely misunderstands frames
-  — those functions ignore it entirely. Frames matter ONLY for
-  sum/count/avg/max/min/collect_list windows. Catch it by reading: a frame
-  on a positional function does nothing and signals a mental-model gap.
-- "Is this NULL delivered or assumed?" (Day 14): a COALESCE / fallback
-  wrapped around an expression that can FAIL (element_at, subscript, cast,
-  divide) is only correct if that expression returns NULL rather than
-  throwing — and that is a SESSION CONFIG (ANSI), not a language guarantee.
-  Reading the fallback as evidence of NULL-safety is the mistake. Ask where
-  the NULL comes from; if the answer is "the function returns NULL on
-  failure", demand the try_* form. This is the failure-mode sibling of the
-  aggregate-NULL rule: that rule prunes defensive code because NULL handling
-  is guaranteed, this one ADDS defensive code because it isn't.
-- Hand-rolled parsing where a format built-in exists (Day 14): the AI built
-  a 5-layer split/transform/filter/element_at nest to parse a query string
-  that `str_to_map(payload,'&','=')` handles in one call. Two costs beyond
-  verbosity — it mixed 0-based subscript (kv[0]) with 1-based element_at in
-  ONE expression, and it manufactured an out-of-bounds failure mode the
-  built-in cannot have. Review trigger: a chain of generic array primitives
-  operating on a string that was just split is a signal to go look for the
-  format-specific function. Sibling of the Day 12 hallucination heuristic —
-  there the AI invented an API that didn't exist, here it ignored one that
-  did. Both are "did you check what the standard library already offers".
-- Empty-string vs absent is a SPEC question, not an edge case to smooth
-  over (Day 14): `tier=` (key present, value empty) and no `tier` key at all
-  are DIFFERENT states, and the spec reserved 'UNKNOWN' for the ABSENT case
-  only. A regex `+`, a truthiness check on the extracted value, or an
-  `if not value` guard all silently collapse the two. When a spec names a
-  sentinel for "absent", check what the code does with "present but empty"
-  BEFORE approving — the two paths look identical in the happy case.
+## API 风格约定
+- 纯列引用(select/groupBy/on)-> 用普通字符串;当列参与表达式(比较、算术、
+  .desc()/.alias()/.cast()、when())、引用链中途新建的列、alias 限定名
+  ("t.col")、或程序化生成列时 -> 用 F.col()。自连接消歧用 df["col"](绑定的)。
+- DATE_SUB(date, int_col) 优于 date - int(可移植性:MySQL/Hive 行为不同);
+  F.date_sub 从 Spark 3.3+ 才接受 Column。
+- try_cast 只用于**确实脏**的数据;普通 cast 表达意图。
+- count/sum 之后 cast("int"):给生产 sink 的 schema 卫生(count 返回 BIGINT);
+  测试两种写法都抓不到。
+- LATERAL VIEW OUTER EXPLODE(Hive 风格,兼容性最好)vs 现代的
+  LATERAL explode_outer(...)——Spark 3.x 里都可以。
+
+## Review 启发式(累积)
+- 在不寻常的上下文里(pivot 的聚合位、自定义聚合),不要信任 star/通配符表达式
+  ——解析路径不同。
+- 聚合-NULL 规则可以在**两个方向**上裁剪代码:补上漏掉的 NULL 处理,**以及**
+  删掉冗余的防御代码。
+- 当 explain() 与预期矛盾时,**先看 Scan 节点类型**——统计信息是否可用能解释
+  一半的优化器行为。
+- 输出的**列顺序**对按位置比较的测试是有意义的;一个重排列的 select 是对下游
+  消费者的**静默契约变更**。
+- 性能结论用**数 Exchange 节点**来验证,不要凭记忆。
+- **"shuffle 更少"是一个诱人但常常错误的性能故事**:当两条路线的 Exchange 数
+  **相同**时,真正的差别是每个 stage 的**重量**(可 partial 聚合的 aggregate
+  vs 完整 sort)。说出真正的机制,不要断言 shuffle 数量的差异。
+- **一个 COUNT 未必是你以为的那个 count**:COUNT(field) 的含义是"field 非 NULL
+  的行数",当非 NULL 集合恰好与你想要的集合重合时,它会静默地等于错误的指标
+  (COUNT(device.os) == mobile_events 只是因为测试行里非空的 os 恰好全是移动端)。
+  按定义从参数的 NULL 行为**重新推导**每个 COUNT 实际在数什么。
+- **碰巧正确的输出是伪装**:错误层级的去重可能在某些组上给出正确数字(用户 1
+  的三个不同 key 数组 = 三个不同 key)。要**逐个边界行验证机制**,而不是只看
+  最终数字。
+- **误导性的列名能通过测试,但通不过 code review**:一个装着全部属性 key 的列
+  却叫 "devices",是对下游读者的契约谎言。
+- SQL 里的否定存在性:默认伸手拿 **NOT EXISTS / LEFT ANTI**,不是 NOT IN。
+  NOT IN 要求**两侧**都无 NULL;isNotNull 这个补丁下一个人随手就能删。
+  把 NOT IN 留给常量列表,或留给"确实想要三值 NULL 毒化"的场合。
+- **"join 前 distinct"的气味**:如果这个 join 是 semi/anti,那 distinct 一定是
+  冗余的(存在性忽略重数)。如果是 inner,那 distinct 可能是在补偿一个本不该
+  发生的 grain 变化——考虑改用 semi。
+- **题面里的边界样例是契约,不是装饰**:Day 10 那一行 region 真为 NULL 的样例
+  **就是**整个陷阱。AI 的解法正确处理了小计 NULL,却从未让真实 NULL 浮出水面
+  ——它把那一行当成了插图,而不是一等需求。当题目**恰好**给出一行来演示某个
+  边界情况时,在读任何解法之前先把它提升为必须处理的用例。
+- **GROUPING_ID 的魔数隐藏着位序假设**:gid.isin(2,3) == "region 被卷起"只有在
+  region 是 grouping_id 的最左(最高位)参数时才成立。按列写的 grouping() 形式
+  更啰嗦但不需要回忆位序——共享代码里优先用它,grouping_id 留给多维度单 CASE
+  的 level 映射。无论哪种,值->含义的映射必须钉在**参数顺序**上,而不是表里的
+  列顺序。
+- **"这是哪一种 NULL"——聚合轴版本**:任何 cube/rollup/grouping-sets 之后,
+  grouping 列里的 NULL 默认是有歧义的。要么在聚合**之前**预填哨兵(根治),
+  要么每一次维度重建都**先**用 GROUPING()==1 把关——**永远不要**在 grouping-sets
+  的结果上单凭 `IS NULL` 重建一个维度。
+- **IS NULL 搭着 grouping 位一起出现**(Day 12):`WHEN col IS NULL AND gid=k
+  THEN 'ALL'` 在干净数据上能过,但是气味——gid(或 grouping(col)=1)是**唯一**
+  的根判据,IS NULL 合取项冗余且在告诉下一个人"NULL 是决策的一部分"。删成
+  `WHEN gid=k`。这是 Day 10"永远不要单凭 IS NULL 重建维度"的姊妹条——这里的
+  失败方向相反(IS NULL 存在但多余),修法相同:只留 gid。
+- **HAVING 其实是 WHERE**(Day 11):在 HAVING 里对 GROUP BY 键做过滤,之所以
+  恰好等价于 WHERE,只是因为该谓词碰的是分组键而不是聚合结果。它**能通过**但
+  是气味——它依赖"过滤列恰好是分组键"这一点,并且放弃了把谓词下推到聚合之前的
+  机会。行级谓词属于 WHERE;HAVING 留给对聚合结果的条件。**靠读就能抓到**:
+  问一句"这个谓词作用在原始列上还是聚合结果上?"——原始列出现在 HAVING 里
+  就该挪去 WHERE。
+- **给排名/位置函数设 frame 是 no-op 气味**(Day 13):看到 rowsBetween /
+  rangeBetween 挂在 row_number / rank / dense_rank / lag / lead / ntile 上,
+  作者多半误解了 frame——这些函数完全忽略它。frame **只**对
+  sum/count/avg/max/min/collect_list 窗口有意义。靠读就能抓到:位置函数上的
+  frame 什么也不做,标志着心智模型有缺口。
+- **"这个 NULL 是被交付的,还是被假定的?"**(Day 14):把 COALESCE / fallback
+  包在一个**可能失败**的表达式(element_at、下标、cast、除法)外面,只有当该
+  表达式返回 NULL 而不是抛异常时才是正确的——而这是 **session 配置**(ANSI),
+  不是语言保证。把 fallback 当成 NULL 安全的证据,正是这里的错误。问一句
+  "这个 NULL 从哪来?";如果答案是"函数失败时返回 NULL",就要求换成 try_\* 形式。
+  这是聚合-NULL 规则的**失败模式兄弟**:那条规则因为 NULL 处理有保证而**删掉**
+  防御代码,这条因为没有保证而**加上**防御代码。
+- **有格式内置函数却手搓解析**(Day 14):AI 用了 5 层
+  split/transform/filter/element_at 嵌套去解析一个 query string,而
+  `str_to_map(payload,'&','=')` 一行就够。除啰嗦之外还有两笔代价——它在**一个**
+  表达式里混用 0-based 下标(kv[0])和 1-based element_at,并且**制造**了一个内置
+  函数不可能有的越界失败模式。审查触发点:**一串通用数组原语作用在一个刚被
+  split 的字符串上**,就是去找格式专用函数的信号。这是 Day 12 幻觉启发式的
+  兄弟条——那次 AI 发明了一个不存在的 API,这次它忽略了一个存在的 API。两者都是
+  "你查过标准库里已经有什么了吗"。
+- **API 幻觉——看着合理但并不存在的 DSL 函数**(Day 12):AI 在 DSL 里写了
+  F.grouping_sets([...], "region", "category")。它**不存在**——3.x 没有,
+  Spark 4.2 也没有(运行时 AttributeError,整个作业死掉)。这个名字之所以危险,
+  恰恰因为它镜像了真实的 SQL `GROUP BY GROUPING SETS` 子句,读起来"显然是对的"。
+  真实 DSL 有 df.cube / df.rollup + F.grouping / F.grouping_id,但**没有**
+  grouping_sets helper。启发式:对任何你没有亲手用过的 F.* / df.* 调用,
+  **"名字和 SQL 关键字对得上"不是它作为 Python API 存在的证据**——先验证
+  (dir(F)、文档、跑一个 scratch)再信。与 SQL 的对称性是诱饵,不是保证。
+- **"SQL 能跑"不等于"DSL 同形写法能跑"**(Day 15,与上一条对称):同一件事在
+  两套 API 上的类型契约可以不一致。`RANGE BETWEEN 6 PRECEDING` 在 SQL 里对
+  DATE 列合法(字面量解析成 INT),而 DSL 的 rangeBetween(-6, ...) 在同一列上
+  分析期就失败(Python int 落成 BIGINT)。跨 API 移植窗口/frame 写法时,
+  **先在目标 API 上跑一次**,别假设语义等价就意味着类型契约等价。
+- **PySpark 的报错文案描述的是异常抛出点的语法现象,不是根因**(Day 15):
+  CANNOT_CONVERT_COLUMN_INTO_BOOL 只说明"某个 Column 进了需要真值的位置"——
+  除了查自己写的 and / 括号,还要查**传给 API 的参数类型是不是本该是 Python
+  标量**(Spark 自己的库函数内部做 `if arg <= x` 时会触发同样的错)。
+  相关的 Python 侧硬性习惯:`&` / `|` 的优先级**高于**比较运算符(而 `and`
+  低于),所以每个操作数都要**各自加括号**;`&`/`|` 是逐行表达式,**不短路**。
+- **一列"百分比"如果和原始金额同步变化,分母多半被约掉了**(Day 15):
+  `(revenue - prev / prev * 100)` 因为 `/`、`*` 优先于 `-`,实际等于
+  `revenue - 100`。它在某一行上会**碰巧正确**(200-100=100 恰好等于真实增长率
+  100%),别的行才暴露。靠读抓的方法:**检查量纲**——增长率不该长得像营收。
+- **"多余的列"几乎从来不是性能问题**(Day 15 AI review,严重度归类修正):
+  看到一个用不上的中间列(如 SQL 里其实不需要的天序号 CTE),第一反应容易是
+  "多算了 = 慢"。**先数 Exchange 再下结论**:实测带天序号列与直接 ORDER BY
+  DATE 的 SQL,两者都是 **1 个 Exchange、1 个 Window 节点**,结果一致——
+  窄投影不产生 shuffle,代价为零。这类发现属于 **Style/clarity(冗余、
+  多一个概念要读)**,不属于 Performance。把它记在 Performance 栏会让
+  review 的严重度排序失真:真正的 Performance 问题是多出来的 Exchange /
+  多一次扫描 / 单分区窗口,不是多一个 withColumn。
+- **同一条发现在两套 API 上的结论可以相反**(Day 15):"这个天序号列是多余的"
+  在 **SQL 侧成立**(SQL 的 frame 子句直接吃 DATE 列),在 **DSL 侧不成立**
+  (PySpark 的 rangeBetween 必须要数值排序列,见 RANGE frame 类型约束一节)。
+  跨 API 的 review 结论要分别落地,不能从一侧推另一侧。
+- **`WHEN x = 0 THEN NULL` vs `WHEN x > 0 THEN ...`——分歧在负数上**(Day 15):
+  规格写的是"prev_day_revenue 为 0 时返回 NULL",那么 `= 0` 是**字面忠实**的
+  实现,而 `> 0` 在 prev 为**负数**(退款日)时会静默返回 NULL,偏离了规格。
+  测试数据里没有负营收,两种写法都绿——又一个测试无法区分的分歧。
+  读的时候问:**规格排除的是"零",还是"非正"?** 把条件写成规格里那个词。
+  (附带:对**计算得来**的 double 做 `== 0.0` 精确比较通常脆弱;这里安全只是
+  因为那个 0.0 来自 COALESCE 的字面量而非浮点运算。)
+- **用 f-string 拼 SQL**(Day 15):AI 把视图名和 epoch 常量用 f-string 插进
+  SQL。这里的值是模块级常量,没有注入风险;但这个习惯本身值得在 review 里点名
+  ——一旦被插入的值来自外部输入,它就是注入路径。参数化或固定常量拼接是更稳的
+  默认姿势。
