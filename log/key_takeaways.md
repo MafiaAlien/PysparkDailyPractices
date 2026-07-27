@@ -395,7 +395,7 @@
   给 lag/rank 设 frame 是 no-op,是一种气味。
 
 ## RANGE frame 的类型约束 (Day 15,实测修正 Day 13 的旧记录)
-- **旧记录是错的**,已在 Spark 4.2.0 实测推翻:04 曾写"DATE orderBy 上整数就是
+- **旧记录是错的**,已在 Spark 4.1.1 实测推翻:04 曾写"DATE orderBy 上整数就是
   天,纯 DSL 无需 expr"、"TIMESTAMP orderBy 上整数是秒"。**在 PySpark 里这两条
   都跑不通**,报 DATATYPE_MISMATCH.RANGE_FRAME_INVALID_TYPE:
   `The data type "DATE" used in the order specification does not support the
@@ -670,7 +670,7 @@
   `COALESCE(v,'UNKNOWN')` 看着像同一件事,但对 Catalyst 是**不同的表达式**,
   分区不复用、join 也匹配不上。
 
-## null-safe join 的物理形态 (Day 16 实测, Spark 4.2.0)
+## null-safe join 的物理形态 (Day 16 实测, Spark 4.1.1)
 - `a <=> b` **不是**一个特殊的 join 算子。Catalyst 把它 desugar 成**两个普通
   equi-key**:`coalesce(col, '')` 和 `isnull(col)`——**它自己做了哨兵预填,
   再补一位布尔标志来防撞车**。计划里直接可见:
@@ -868,14 +868,20 @@
   split 的字符串上**,就是去找格式专用函数的信号。这是 Day 12 幻觉启发式的
   兄弟条——那次 AI 发明了一个不存在的 API,这次它忽略了一个存在的 API。两者都是
   "你查过标准库里已经有什么了吗"。
-- **API 幻觉——看着合理但并不存在的 DSL 函数**(Day 12):AI 在 DSL 里写了
-  F.grouping_sets([...], "region", "category")。它**不存在**——3.x 没有,
-  Spark 4.2 也没有(运行时 AttributeError,整个作业死掉)。这个名字之所以危险,
-  恰恰因为它镜像了真实的 SQL `GROUP BY GROUPING SETS` 子句,读起来"显然是对的"。
-  真实 DSL 有 df.cube / df.rollup + F.grouping / F.grouping_id,但**没有**
-  grouping_sets helper。启发式:对任何你没有亲手用过的 F.* / df.* 调用,
-  **"名字和 SQL 关键字对得上"不是它作为 Python API 存在的证据**——先验证
-  (dir(F)、文档、跑一个 scratch)再信。与 SQL 的对称性是诱饵,不是保证。
+- **API 幻觉——找错命名空间**(Day 12;2026-07-27 实测修正本条前一版):AI 在 DSL
+  里写了 `F.grouping_sets([...], "region", "category")`。`F.grouping_sets`
+  **在任何版本都不存在**(实测 pyspark 4.1.1:`dir(F)` 里含 grouping 的只有
+  `grouping` 和 `grouping_id`),运行时 AttributeError,整个作业死掉。
+  **但这个能力本身是存在的**——真名 `DataFrame.groupingSets(groupingSets, *cols)
+  -> GroupedData`,`versionadded:: 4.0.0`,是 **df 的方法而不是 F 的函数**。
+  所以 3.x 里 DSL 确实无路(只能 df.cube / df.rollup 或走 SQL),4.0 起有了
+  ——**本条旧版写的"没有 grouping_sets helper"是错的**。
+  两层教训:(1) **命名空间**——`F.*` 和 `df.*` 是两个不同的 API 面,能力"存在"
+  不等于"在你以为的那个模块里";(2) **命名风格**——PySpark 里 DataFrame 方法是
+  camelCase(`groupingSets` / `dropDuplicates` / `withColumn`),functions 模块是
+  snake_case(`grouping_id` / `array_agg`);把 SQL 关键字直译成 snake_case 再挂到
+  `F.` 上,这两条同时错了。启发式:对没亲手用过的调用,先问"**在哪个对象上、
+  什么命名风格**",再 `dir()` 验证。与 SQL 的对称性是诱饵,不是保证。
 - **"SQL 能跑"不等于"DSL 同形写法能跑"**(Day 15,与上一条对称):同一件事在
   两套 API 上的类型契约可以不一致。`RANGE BETWEEN 6 PRECEDING` 在 SQL 里对
   DATE 列合法(字面量解析成 INT),而 DSL 的 rangeBetween(-6, ...) 在同一列上

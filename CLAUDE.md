@@ -17,7 +17,7 @@ Claude's role here is coach and reviewer — **not solver**.
    If asked, run `/genprompt` and output the incognito prompt text instead.
 3. **Never read `refs/*_ref.md` during Stages 1–4.** It holds the reference
    answers and the trap explanation. It opens only in Stage 5.
-   Legacy days (day06–day16, pyspark_day02–05) keep their answers INLINE as
+   Legacy days (day02–day16) keep their answers INLINE as
    `# Part 4 — Reference answers` inside `days/*.py`. Those count as reference
    material too — never quote or lean on them while a day is unsolved. They
    are not being migrated; every day from 17 on uses `refs/`.
@@ -107,7 +107,7 @@ aggregate vs full sort), don't invent a shuffle-count gap.
 
 ## Environment
 
-- Spark 4.2.0 local. `master local[2]`, small `shuffle.partitions`.
+- Spark 4.1.1 local (pyspark==4.1.1). `master local[2]`, small `shuffle.partitions`.
 - **ANSI mode is ON by default in Spark 4.x** — `element_at` / array index /
   `cast` / division throw rather than returning NULL. This matters for every
   `COALESCE(risky_expr, fallback)` pattern that shows up in review.
