@@ -1,4 +1,4 @@
-# 累积要点 (Day 1-15)
+# 累积要点 (Day 1-16)
 
 > 术语、API 名、函数名、报错类名一律保留英文;正文用中文。
 
@@ -224,6 +224,11 @@
   两者都显示 2 个 Exchange,但 struct 路线的第二个是一对 HashAggregate,
   window 路线的是 Sort+Window。**别把结论记成"shuffle 更少"——那是错的;
   记成"第二个 Exchange 处聚合胜过排序"。**
+- **(Day 16 限定)** 上面"window 没有 partial-agg 缓解"这句**只在没有 rank 过滤时
+  成立**。一旦写了 `rk = 1` / `rk <= k`,Spark 3.5+ 会插入 `WindowGroupLimit`
+  把 top-k 下推到 shuffle **之前**(计划里 Exchange 之下是 `..., Partial`,
+  之上是 `..., Final`),等于 window 版的 map 端缩减。详见"修正:rank-filter
+  window 有 map 端缩减"一节。
 
 ## 复杂聚合: GROUPING SETS / ROLLUP / CUBE (Day 10)
 - 这是**三个不同的层次**,不是并列的兄弟:
@@ -591,8 +596,9 @@
   非 broadcast join(两侧)、Window.partitionBy、orderBy、repartition、
   intersect/except。窄依赖(无 shuffle):select/filter/withColumn/explode/
   union/coalesce(缩小)。
-- 相同分区只有在**分区表达式完全匹配**时才能复用(ENSURE_REQUIREMENTS);
-  子集/超集 key 仍然要重新 shuffle。
+- 相同分区的复用由 ENSURE_REQUIREMENTS 判定。**~~子集/超集 key 仍然要重新
+  shuffle~~ 这句是错的**,已在 Day 16 实测推翻:**只有超集方向要重新 shuffle**,
+  子集方向是免费的。完整规则和实测见下面"Exchange 复用的判定"一节。
 - **窗口相关的 AnalysisException 先读 plan 片段,不要只读错误文案**:报错自带
   的 logical plan 里 `windowspecdefinition(...)` 直接告诉你窗口**实际**按什么排序、
   frame **实际**是什么,比文案准得多(Day 15:文案说"DATE 不支持 BIGINT",
@@ -609,6 +615,186 @@
   测试两种写法都抓不到。
 - LATERAL VIEW OUTER EXPLODE(Hive 风格,兼容性最好)vs 现代的
   LATERAL explode_outer(...)——Spark 3.x 里都可以。
+
+## NULL 语义总表 (Day 16)
+- **`=` 在 NULL 上不自反**:`NULL = NULL` 是 UNKNOWN 而不是 TRUE。所以任何
+  **可空列作为 join key** 的地方,那些行都会静默地匹配不上。null-safe 相等:
+  DSL `a.eqNullSafe(b)` / SQL `a <=> b`(同义于 `a IS NOT DISTINCT FROM b`)。
+  它对 NULL-NULL 返回 TRUE、对 NULL-值返回 FALSE,**永不返回 NULL**。
+- **四套"相等"机制对 NULL 的态度并不一致**,这才是可空 key 危险的根源:
+  * `JOIN ON a = b`      -> NULL 永不匹配(行被丢弃 / 被 null-padding)
+  * `GROUP BY col`       -> 所有 NULL 归为**一组**
+  * `Window.partitionBy` -> 所有 NULL 归为**一个分区**
+  * `DISTINCT` / `dropDuplicates` -> NULL 之间**互相相等**
+  一句话:**分组把 NULL 当值,连接把 NULL 当未知**。Day 16 的 SQL 里
+  `GROUP BY sku, variant` 和 `ON c.variant <=> a.variant` 同时出现,正是这两种
+  语义在同一个查询里各司其职。
+- **默认 NULL 排序**:ASC -> NULLS FIRST,DESC -> NULLS LAST。所以一个普通的
+  `orderBy(col.asc())` 排名会把**值缺失**的行顶到第一名。改写方式:DSL
+  `asc_nulls_last()` / `desc_nulls_first()`,SQL `NULLS FIRST|LAST`。
+- **"过滤掉 NULL"和"NULLS LAST"不是可互换的两种修法**。Day 16 里
+  best_seller 的规格是"未知价格**不能**当选",这是**过滤**语义:某个 key 只有
+  未知价格的 offer 时,NULLS LAST 照样让它 rn=1(输出 'foxtrot' 而不是 'NONE')。
+  一旦加了 filter,`NULLS LAST` 就退化成**死代码**——同 Day 15"一个 COALESCE
+  承重、另一个是死代码"的判别练习:两个都像在治 NULL,只有一个是承重的。
+- **LEFT join 之后 COUNT(\*) vs COUNT(col)**:没有匹配的左行仍然产出**一条**
+  物理行,所以 `COUNT(*)` 对空组报 **1**;`COUNT(右表的某列)` 才报 0
+  (聚合-NULL 规则,Day 7 / Day 12 同族)。
+- **NULL 的责任会随结构转移**。同一个规格,先 join 再 groupBy 时由
+  `count(seller)` 吸收 padding 行;改成先 groupBy 再 join 之后,聚合的输入里
+  根本没有 padding 行(`count(*)` 就对了),而"catalog 有、offers 没有"的那些
+  key 是在 join **之后**才第一次以 NULL 出现,只能靠 `COALESCE(n_offers, 0)` 收。
+  **要不要写防御代码,必须先看结构,不能背模板。**
+- **同一个 NULL 可能有多个来源**:Day 16 的 best_price 为 NULL 既可能是
+  "这个 key 在 offers 里不存在",也可能是"存在但全是未知价格"。本题两种都要
+  NULL,所以无害;但要养成问一句的习惯——**这个 NULL 有几个来源?规格对每个
+  来源要的是不是同一个值?** 要区分就需要 n_offers 或 grouping 位这类额外信号,
+  单凭 `IS NULL` 不够(Day 10 / Day 12 的同一条纪律换到了 join 轴上)。
+
+## 哨兵路线 vs `<=>` 路线 —— 四维取舍 (Day 16)
+- **哨兵(sentinel)= 用一个值域里不可能出现的普通值顶替 NULL**,让 NULL 从此
+  消失,于是 `=` 恢复正常工作(`coalesce(variant,'BASE')`)。这是 Day 10
+  "cube 之前预填哨兵"的原样复用:买到一条贯穿全查询的不变量——"这列没有 NULL"。
+- 两条路线的完整对比:
+  | | 哨兵预填 | `<=>` / eqNullSafe |
+  |---|---|---|
+  | 撞车风险 | 有(哨兵值可能是合法值) | 无 |
+  | 复发风险 | 无(填一次,全查询有效) | **每个** join 都要重写,漏一个就静默出错 |
+  | 可读性 | key 列身兼二职,易与输出标签混淆 | 意图直白 |
+  | 物理分区可复用性 | **优**(哨兵是真实列) | **劣**(派生表达式,见下节) |
+- 哨兵路线的**实操坑**:被填过的 key 列会同时承担"join key"和"输出标签"两个
+  身份,最后 select 时很自然就把它当原列输出了(Day 16 里输出成 `variant` 而
+  规格要 `variant_label`——按位置比较的测试**抓不到**)。中间列另起名 `vkey`,
+  输出时再 alias,可以从结构上消除这个混淆。
+- 哨兵字面量必须**只写一次**(抽成 CTE / 变量):`COALESCE(v,'BASE')` 和
+  `COALESCE(v,'UNKNOWN')` 看着像同一件事,但对 Catalyst 是**不同的表达式**,
+  分区不复用、join 也匹配不上。
+
+## null-safe join 的物理形态 (Day 16 实测, Spark 4.2.0)
+- `a <=> b` **不是**一个特殊的 join 算子。Catalyst 把它 desugar 成**两个普通
+  equi-key**:`coalesce(col, '')` 和 `isnull(col)`——**它自己做了哨兵预填,
+  再补一位布尔标志来防撞车**。计划里直接可见:
+  `BroadcastHashJoin [sku#0, coalesce(variant#1, ), isnull(variant#1)], [...]`
+- 推论 1:null-safe join **不会**退化成 BroadcastNestedLoopJoin,它是完全正常的
+  equi-join,能 broadcast、能 hash 分区。
+- 推论 2(取舍里最容易漏的一笔):这对 key 是**派生表达式**,与上游任何
+  `GROUP BY sku, variant` 的输出分区**都不匹配** -> 不复用,SMJ 计划里要多插一个
+  Exchange 专门为 join 重分区。实测(同一份单次聚合的 SQL,只换 join 写法):
+  * 强制 SMJ(AQE off / broadcast off):`<=>` = **3** 个 Exchange,哨兵 = **2**
+  * AQE + broadcast(小表):两者都是 **2** —— **broadcast join 对两侧分区没有
+    任何要求**,差异被完全抹平
+- 所以**哨兵在分区复用上的优势,只有在 join 大到 broadcast 不了时才兑现**——
+  恰好是它值钱的那个规模。小表上永远看不见。**这就是为什么这类结论必须关掉
+  AQE + broadcast 再读一遍计划。**
+- 记账要诚实:省掉的那个 Exchange 搬的是**已聚合**的数据(每 key 一行),是三个
+  里最轻的;真正重的是 offers 那次 partial->final。数字站得住,但分量比数字小。
+
+## Exchange 复用的判定 (Day 16 实测) ★核心
+实测四组(同一张 offers 表,关掉 AQE 与 broadcast):
+
+| 场景 | Exchange | Scan | 结论 |
+|---|---|---|---|
+| 1. 两个 `groupBy(sku,vkey)` **兄弟分支**再 join | **2** | **2** | key 全同也不复用 |
+| 2. `window(sku,vkey)` -> `groupBy(sku,vkey)` **串联** | **1** | 1 | 复用 |
+| 3. `groupBy(sku,vkey)` -> `groupBy(sku)` 串联 | **2** | 1 | 分区键是**超集**,不满足 |
+| 4. `window(sku)` -> `groupBy(sku,vkey)` 串联 | **1** | 1 | 分区键是**子集**,满足 |
+
+场景 1 和 2 是**同样两个聚合、同样的 key**,只是排列方式不同 -> 2 vs 1。
+
+**复用需要两个条件同时成立:**
+
+- **条件一:在同一条链上(血缘)。** Exchange 的产物是"一份已分好区的数据",
+  只有沿血缘往上的算子拿得到。兄弟分支各读各的 Scan,谈不上复用。
+  **读计划的信号:数这张表被 `Scan` 了几次。**场景 1 是 Scan=2,场景 2 是 Scan=1。
+  Scan 重复了,底下的 Exchange 一个都省不掉,除非改写查询合并分支。
+  第二重佐证是 attribute id(`sku#0` vs `sku#19` = 两次独立扫描)。
+  注意复用是**逐个算子**判定的:场景 1 的 join 本身**没有**再加 Exchange
+  (总数 2 不是 3),因为两侧都已按 `(sku,vkey)` 分好区。
+- **条件二:交付的分区能满足下游的需求。** 各算子的需求:
+  | 算子 | 需要的分布 |
+  |---|---|
+  | `HashAggregate` / `SortAggregate` | 按 **grouping keys** 聚簇 |
+  | `Window` | 按 **partitionBy** 聚簇 |
+  | `SortMergeJoin` / `ShuffledHashJoin` | 两侧各按 **join keys** 聚簇且互相兼容 |
+  | `BroadcastHashJoin` | **无要求** |
+  | `Project` / `Filter` | 无要求,原样透传子节点的分区 |
+
+  **方向规则(极易记反):分区键 ⊆ 需求键 -> 满足;分区键 ⊋ 需求键 -> 不满足。**
+  * 场景 4:交付 `(sku)`,下游要 `(sku, vkey)` -> **子集,满足**。直觉:
+    `(sku,vkey)` 相同的行必然 `sku` 相同,本来就在同一分区里,只是分区更粗。
+  * 场景 3:交付 `(sku, vkey)`,下游只要 `(sku)` -> **超集,不满足**。
+    `sku` 相同但 `vkey` 不同的行被打散了,必须重新聚拢。
+  * **这条推翻了 04 旧记录里"子集/超集都要重新 shuffle"的说法。**
+- **匹配是在语义相等层面做的,不是名字**:实测里聚合 key 叫
+  `_groupingexpression#36`、join key 叫 `vkey#29`,**名字不同照样复用**
+  (alias 透明)。而 `coalesce(v,'')+isnull(v)` 与裸 `v` 是**真的不同的表达式**。
+  判断方法:把两处 key **化简到底层表达式**再比。
+
+**写代码之前的预判(不用等 explain,按顺序问三句):**
+1. **这几个度量是不是都从同一张表出发?** 是 -> 它们注定各付一次 shuffle,
+   除非合并成一个算子。**这是唯一真正能省下大头的动作**,其余都是边角。
+2. **能不能合并?** 同一个 grain 的多个度量塞进**一个** `agg`
+   (Day 16:`count(*)` + `min(struct(price, seller))`);"排名 + 计数"这类混合
+   形态用同一个 `partitionBy` 的多个 window 叠在**一条链**上(Day 8)。
+   Day 16 实测合并的收益:Exchange 3->2、源表扫描 2->1、join 2->1。
+3. **不能合并的部分,下游的 key 是不是上游 key 的超集?** 是 -> 免费;
+   反过来 -> 多付一次。但注意这条的**适用面很窄**,见下一节。
+
+**读计划时的固定动作:**
+1. 数 `Exchange hashpartitioning` 总数,数 `Scan` 次数;
+2. 每个 Exchange 往上看**紧邻的算子**,确认它要什么、这次为什么不满足;
+3. 看到 `BroadcastHashJoin` 就知道**该 join 上的复用讨论全部作废**(它对分区
+   无要求)——这也是为什么小表上的计划会掩盖真实代价;
+4. **关掉 AQE 和 broadcast 再看一遍**,那才是"大数据下会发生什么"。
+
+**测量陷阱(实测时真踩到):** 第一版测场景 4 时,窗口列没有被下游使用,
+**整个 Window 算子被列裁剪删掉了**,量到的是一个假计划(Exchange 显示在
+`(sku,vkey)` 上而不是 `(sku)` 上)。**测某个算子的代价时,先确认它的输出真的被
+最终结果依赖**,否则你量的是一个 Catalyst 已经删掉的东西。
+
+## 多 grain 汇总的方向性 (Day 16 实测)
+- **"上游算粗的、下游算细的"作为一条 groupBy 链是语义上不可能的**:`groupBy`
+  **塌缩行**,聚合完 `(sku)` 之后 `vkey` 这一列已经不存在了。实测直接报
+  `AnalysisException [UNRESOLVED_COLUMN.WITH_SUGGESTION]`。
+- 所以**细 -> 粗是唯一写得出来的方向**,而它恰好落在"超集 -> 不满足"那一侧:
+  多层汇总**必然**多付一次 Exchange,且**改不掉**(实测链式 `(sku,vkey)->(sku)`
+  = 2 个 Exchange / 1 次 Scan)。
+- **那个"免费方向"真正的适用形态是:上游不塌缩行。** 场景 4 成立是因为上游是
+  **window**——它给每行**贴一列**,行还在、`vkey` 也还在,下游才有细粒度可聚:
+  `withColumn("sku_total", count().over(Window.partitionBy("sku")))` ->
+  `groupBy("sku","vkey")`。这是真实模式(算占比分母 / 组内份额)。
+  **判据收成一句:能白嫖上游 Exchange 的前提是上游没有把下游要的 key 吃掉**
+  ——window / filter / project 可以当上游,groupBy 不行。
+- **多 grain 的正解不是重排顺序,是一次扫描**:实测 `rollup(sku, vkey)` =
+  **1 个 Exchange + 1 个 Expand + 1 次 Scan**,对比链式 groupBy 的 2 个 Exchange。
+  分区键是 `hashpartitioning(sku, vkey, spark_grouping_id)`——grouping id 参与
+  分区,所以不同 grain 的行天然分得开。
+  接回 Day 10 / Day 12:当时记的是"单次扫描 vs 4 个 groupBy union 扫 4 次";
+  今天补上另一半——**改成链式串联虽然只扫 1 次,但省下的是 Scan,省不下
+  Exchange;两样都想省只有 grouping sets 家族。**
+- 记账:链式那个多出来的 Exchange 搬的是**已聚合**的数据(每 key 一行),很轻。
+  别为了躲它去扭曲代码结构——真正值得动手的还是"源表被 Scan 了几次"。
+
+## 修正:rank-filter window 有 map 端缩减 (Day 16,限定 Day 7 的记录)
+- 旧记录:"window 的第二阶段是对每行做完整 SORT + Window,没有 partial-agg
+  缓解"。在 **`row_number() = 1` / `rk <= k` 这类 top-k 过滤**下**不成立**:
+  计划里 `WindowGroupLimit [...], row_number(), 1, Partial` 位于 Exchange
+  **之下**,`..., Final` 在其上——rank 过滤被下推到 shuffle 前,每个 map 分区
+  只送出每个 key 的 top-1。这就是 window 版的 partial aggregation(Spark 3.5+)。
+- 触发条件是**存在对 rank 结果的 <= k 过滤**;没有该过滤时旧结论仍然成立。
+  Day 7 的"struct-argmax 第二阶段更轻"应降级为
+  "**在没有 WindowGroupLimit 的场景下**更轻"。
+- 配套发现:`min(struct(...))` 只能走 **SortAggregate**(struct 不是可变定长的
+  聚合 buffer 类型),因此 partial / final 各多一个 `Sort`;`sum`/`count` 那支是
+  `HashAggregate`。`partial_min` 仍在,map 端缩减没丢——但"struct-argmax 是纯
+  聚合所以更轻"要加限定:**它是 sort-based 聚合**。又一次"别把结论记成 shuffle
+  数量,要记成每个 stage 的重量"。
+
+## AQE 复现确认 (Day 16,印证 Day 5)
+- Day 16 两份计划的 Initial 都是 `SortMergeJoin`、Final 都是 `BroadcastHashJoin`
+  ——`Scan ExistingRDD` 没有统计信息,静态阈值不敢 broadcast,AQE 拿到真实大小
+  后才转换。**catalog 侧的 Exchange 已经付过了**,只能靠 `AQEShuffleRead local`
+  省掉网络拉取。这正是 Day 5 记的成本序:显式 hint < AQE 转换 < 完整 SMJ。
 
 ## Review 启发式(累积)
 - 在不寻常的上下文里(pivot 的聚合位、自定义聚合),不要信任 star/通配符表达式
@@ -728,3 +914,33 @@
   SQL。这里的值是模块级常量,没有注入风险;但这个习惯本身值得在 review 里点名
   ——一旦被插入的值来自外部输入,它就是注入路径。参数化或固定常量拼接是更稳的
   默认姿势。
+- **可空列当 join key = 一级审查项**(Day 16):看到 `ON a.k = b.k` 时先问
+  "**k 可空吗?NULL 在这里是缺失还是一个有意义的值?**"。如果 NULL 是有意义的
+  键值(如"无变体的基础商品"),`=` 会静默丢掉整整一类实体。**而当 join 是 LEFT
+  时,失败表现为"看起来完全合理的行"(计数 0、标签 'NONE'),不是缺行**——
+  比丢行更难发现。同族:Day 7 COUNT(device.os)、Day 11 时区方向、Day 13 gap 方向。
+- **"没有匹配"和"匹配了但没有可用值"必须能被区分**(Day 16):Day 16 里只有 S2
+  那一行(key 存在、但所有价格未知)能把这两种情况分开;naive 写法在**其余每一行
+  上都正确**。审查时主动去找**唯一能区分两条假设的那一行**;如果测试数据里没有,
+  这个 review 结论就是没有被验证过的。呼应"题面里的边界样例是契约"。
+- **两个都在治 NULL 的机制,通常只有一个是承重的**(Day 16,Day 15 的姊妹条):
+  `WHERE price IS NOT NULL` 和 `ORDER BY price NULLS LAST` 同时出现时,先问
+  "**去掉其中一个,哪一行会变?**"。Day 16 的答案是过滤承重、NULLS LAST 死代码。
+  同理 Day 15 的两个 COALESCE。判据不是"这里可能有 NULL",而是**具体哪一行**。
+- **防御代码的必要性由结构决定,不由规格决定**(Day 16):同一个"没有 offer 就
+  报 0"的规格,先 join 再 groupBy 时靠 `count(col)` 免费拿到,先 groupBy 再 join
+  时必须写 `COALESCE(...,0)`。**重构调换了聚合与 join 的顺序之后,要重新过一遍
+  所有 NULL 处理**——旧结构留下的守卫会变成死代码(Day 16 里
+  `SUM(CASE WHEN seller IS NOT NULL ...)` 就是这样的残迹,而且它在**谎报**
+  "seller 可能为 NULL"这个不存在的前提)。
+- **同 key 不等于同 shuffle**(Day 16):看到两个 `partitionBy` / `GROUP BY`
+  写着完全相同的 key 就断定"共用一个 Exchange"是**错的**。先问"**它们在同一条链
+  上,还是两条兄弟分支?**"——兄弟分支各付一次 shuffle **加一次源表扫描**。
+  读计划时的落地动作:**先数 Scan 次数,再数 Exchange**。
+- **性能结论必须声明它成立的条件**(Day 16):"`<=>` 比哨兵多一个 Exchange"
+  只在 SMJ 下成立,broadcast 一来就归零;"window 没有 partial-agg"只在没有
+  rank 过滤时成立。**在小数据 + AQE 上读到的计划,系统性地低估分区不匹配的代价**
+  ——要下性能结论就关掉 AQE 和 broadcast 再读一遍。
+- **测计划前先确认被测算子还活着**(Day 16):列裁剪会删掉输出未被使用的算子
+  (实测中整个 `Window` 消失),于是你量到的是一个假计划。**让被测算子的输出
+  真正参与最终结果**,再去数 Exchange。
