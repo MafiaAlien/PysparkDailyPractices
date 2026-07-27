@@ -35,8 +35,8 @@ templates/template_v2.py      day-file skeleton (Parts 1–3, 5-review)
 templates/template_ref.md     reference skeleton (Part 4, Part 5-concept)
 days/dayNN_<slug>.py          the working file — user edits Part 1 and Part 3
 days/dayNN_<slug>_ref.md      reference answers + trap explanation (sealed)
-log/03_problem_log_and_roadmap.md
-log/04_key_takeaways.md
+log/problem_log_and_roadmap.md
+log/key_takeaways.md
 ```
 
 ---
@@ -90,14 +90,14 @@ aggregate vs full sort), don't invent a shuffle-count gap.
 
 - All script content — code, comments, docstrings, identifiers, SQL: **English**.
 - Conversation: **Chinese**.
-- `log/04_key_takeaways.md`: Chinese prose; English for API names, function
+- `log/key_takeaways.md`: Chinese prose; English for API names, function
   names, error class names, config keys, SQL keywords.
 
 ## Context loading
 
-- `log/03_problem_log_and_roadmap.md` is the **authoritative** completion
+- `log/problem_log_and_roadmap.md` is the **authoritative** completion
   status. Read it before generating anything. Never trust memory over it.
-- `log/04_key_takeaways.md` is reference material, not instructions. Load it
+- `log/key_takeaways.md` is reference material, not instructions. Load it
   on demand (in `/review` and `/digest`), not every session.
 
 ## Environment

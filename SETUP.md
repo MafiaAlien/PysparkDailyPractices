@@ -14,8 +14,8 @@ git init
 |---|---|---|
 | `01_project_instructions.md` | 已并入 `CLAUDE.md` | 原文件可以删掉 |
 | `02_template_v2.py` | `templates/template_v2.py` | 已重写，Part 4/5-concept 拆出去了 |
-| `03_problem_log_and_roadmap.md` | `log/03_problem_log_and_roadmap.md` | **原样复制**，不要改内容 |
-| `04_key_takeaways.md` | `log/04_key_takeaways.md` | **原样复制** |
+| `problem_log_and_roadmap.md` | `log/problem_log_and_roadmap.md` | **原样复制**，不要改内容 |
+| `key_takeaways.md` | `log/key_takeaways.md` | **原样复制** |
 
 历史 Day 文件（如果留着）放进 `days/`，参考答案那部分手动拆成
 `days/dayNN_<slug>_ref.md`。不想拆就算了，只对新的天数生效即可。

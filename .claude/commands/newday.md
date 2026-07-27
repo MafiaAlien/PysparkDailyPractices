@@ -7,7 +7,7 @@ Generate the next day's practice problem. Do **not** solve it.
 
 ## Steps
 
-1. Read `log/03_problem_log_and_roadmap.md`. It is authoritative for
+1. Read `log/problem_log_and_roadmap.md`. It is authoritative for
    completion status — do not trust memory or a prior session summary.
 2. Determine the next day number and pick the topic:
    - honor the "Scheduled next" section if it names a candidate
