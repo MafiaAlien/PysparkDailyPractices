@@ -108,3 +108,5 @@ aggregate vs full sort), don't invent a shuffle-count gap.
   `COALESCE(risky_expr, fallback)` pattern that shows up in review.
 - Pin `spark.sql.session.timeZone` in any harness that touches dates.
 - `check()` compares with `sorted()` — order-insensitive, tie-order stable.
+- Run day files with `.venv/bin/python days/dayNN_*.py` — the system python
+  does not have pyspark installed.
