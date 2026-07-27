@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "ask": [
+      "Read(./days/*_ref.md)",
+      "Read(./templates/template_ref.md)",
+      "Bash(cat *_ref.md)",
+      "Bash(head *_ref.md)",
+      "Bash(tail *_ref.md)",
+      "Bash(grep *_ref.md)",
+      "Bash(rg *_ref.md)"
+    ],
+    "allow": [
+      "Bash(python days/*.py)",
+      "Bash(python3 days/*.py)",
+      "Bash(spark-submit *)",
+      "Read(./log/**)",
+      "Read(./templates/template_v2.py)"
+    ],
+    "deny": [
+      "Edit(./days/*_ref.md)"
+    ]
+  }
+}

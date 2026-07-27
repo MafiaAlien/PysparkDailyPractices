@@ -1,2 +1,12 @@
 
 .databricks
+.claude/settings.local.json
+__pycache__/
+*.pyc
+spark-warehouse/
+metastore_db/
+derby.log
+.DS_Store
+**/.DS_Store
+.DS_Store
+**/.DS_Store
