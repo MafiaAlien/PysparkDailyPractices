@@ -9,7 +9,7 @@ Run after `/review`. This is the **only** command permitted to write into
 ## Steps
 
 1. Read `log/problem_log_and_roadmap.md`, `log/key_takeaways.md`, and
-   `days/day$ARGUMENTS*` including the `_ref.md`.
+   `days/day$ARGUMENTS*` and `refs/day$ARGUMENTS*_ref.md`.
 
 2. **Propose the edits in chat first, as a diff-style preview. Write nothing
    yet.**

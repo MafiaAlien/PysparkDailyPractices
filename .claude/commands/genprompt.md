@@ -10,7 +10,7 @@ sitting on disk — that is the entire reason this command exists.
 ## What to read
 
 Only the header docstring of `days/day$ARGUMENTS*.py`: PROBLEM, INPUT SCHEMA,
-EXPECTED OUTPUT, EXAMPLE. Do **not** open `_ref.md`. Do **not** read Part 4 of
+EXPECTED OUTPUT, EXAMPLE. Do **not** open `refs/*_ref.md`. Do **not** read Part 4 of
 anything.
 
 ## What to output

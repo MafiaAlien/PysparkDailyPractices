@@ -1,15 +1,24 @@
 {
   "permissions": {
     "ask": [
+      "Read(./refs/**)",
       "Read(./days/*_ref.md)",
       "Read(./templates/template_ref.md)",
       "Bash(cat *_ref.md)",
       "Bash(head *_ref.md)",
       "Bash(tail *_ref.md)",
       "Bash(grep *_ref.md)",
-      "Bash(rg *_ref.md)"
+      "Bash(rg *_ref.md)",
+      "Bash(cat refs/*)",
+      "Bash(head refs/*)",
+      "Bash(tail refs/*)",
+      "Bash(grep * refs/*)",
+      "Bash(rg * refs/*)"
     ],
     "allow": [
+      "Bash(.venv/bin/python days/*.py)",
+      "Bash(./.venv/bin/python days/*.py)",
+      "Bash(/Users/user/Docs/Projects/Py_scripts/Pyspark_daily/.venv/bin/python days/*.py)",
       "Bash(python days/*.py)",
       "Bash(python3 days/*.py)",
       "Bash(spark-submit *)",
@@ -17,6 +26,7 @@
       "Read(./templates/template_v2.py)"
     ],
     "deny": [
+      "Edit(./refs/**)",
       "Edit(./days/*_ref.md)"
     ]
   }

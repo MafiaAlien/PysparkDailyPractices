@@ -33,7 +33,7 @@ Stage 4  VERIFY  : Un-comment the Stage-4 lines below and run.
 Stage 5  DIGEST  : Fill "Review takeaways" in Part 5, then run /review
                    and /digest.
 
-Reference answers and concept takeaways live in the sibling *_ref.md file.
+Reference answers and concept takeaways live in refs/<this-file>_ref.md.
 Do not open it before Stage 5.
 =====================================================================
 """
@@ -157,4 +157,4 @@ if __name__ == "__main__":
 # - Did I catch it by reading, or only by running?
 # - What review heuristic should I add to log/04 next time?
 #
-# Concept takeaways for this problem: see the sibling *_ref.md file.
+# Concept takeaways for this problem: see refs/<this-file>_ref.md.

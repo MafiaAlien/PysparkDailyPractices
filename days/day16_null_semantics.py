@@ -301,6 +301,11 @@ if __name__ == "__main__":
 # =====================================================================
 # Part 3 — AI Review (NEW in v2)
 # =====================================================================
+# SKIPPED — Stage 2-4 were never run for Day 16 and will not be back-filled.
+# Day 16 is closed at Stage 1 + Stage 5 (digest). This section stays empty on
+# purpose; it is not an outstanding TODO.
+# See log/problem_log_and_roadmap.md (Day 16 status note under the table).
+# ---------------------------------------------------------------------
 # Paste the AI-generated solution here, UNMODIFIED. Review by reading only.
 #
 # def ai_solve_dsl(catalog: DataFrame, offers: DataFrame) -> DataFrame:

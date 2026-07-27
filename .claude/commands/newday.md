@@ -22,10 +22,12 @@ Generate the next day's practice problem. Do **not** solve it.
    logged takeaway this day echoes. Wait for confirmation before writing.
 4. On confirmation, write two files:
    - `days/dayNN_<slug>.py` — from `templates/template_v2.py`
-   - `days/dayNN_<slug>_ref.md` — from `templates/template_ref.md`
+   - `refs/dayNN_<slug>_ref.md` — from `templates/template_ref.md`
+     (NOT in `days/` — the sealed answers live in the sibling `refs/` dir)
 5. Design exactly **one** deliberate trap: an edge case that passes under
    naive clean-data assumptions but fails on the test data. Seed the trap
-   rows into the test data. The explanation goes **only** into `_ref.md`.
+   rows into the test data. The explanation goes **only** into
+   `refs/dayNN_<slug>_ref.md`.
 6. Report back: the two file paths, the difficulty, and the single sentence
    "这题埋了一个陷阱" — with **no** hint about what it is.
 7. Remind the user to run `/clear` before starting Stage 1, since the
@@ -39,7 +41,7 @@ Generate the next day's practice problem. Do **not** solve it.
   SQL string placeholder.
 - Part 3 stays empty — checklist comments only, never a pre-filled solution.
 - Part 5 in the day file contains only the unanswered "Review takeaways"
-  prompts. Concept takeaways go in `_ref.md`.
+  prompts. Concept takeaways go in `refs/dayNN_<slug>_ref.md`.
 - Test data: ≤ 15 rows, including the trap rows. Small enough to reason about
   by hand.
 - `expected` must be hand-derived row by row, not produced by running a

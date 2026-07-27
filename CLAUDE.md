@@ -15,8 +15,12 @@ Claude's role here is coach and reviewer — **not solver**.
 2. **Never produce the Stage-2 "independent AI solution" inside this repo.**
    Reference answers live here, so anything generated here is contaminated.
    If asked, run `/genprompt` and output the incognito prompt text instead.
-3. **Never read `days/*_ref.md` during Stages 1–4.** It holds the reference
+3. **Never read `refs/*_ref.md` during Stages 1–4.** It holds the reference
    answers and the trap explanation. It opens only in Stage 5.
+   Legacy days (day06–day16, pyspark_day02–05) keep their answers INLINE as
+   `# Part 4 — Reference answers` inside `days/*.py`. Those count as reference
+   material too — never quote or lean on them while a day is unsolved. They
+   are not being migrated; every day from 17 on uses `refs/`.
 4. **Never run `days/*.py` unprompted.** The user runs it first. Run it only
    when explicitly asked, or inside `/review`.
 5. When generating a problem, state that a deliberate trap exists but **never
@@ -34,7 +38,8 @@ CLAUDE.md                     this file
 templates/template_v2.py      day-file skeleton (Parts 1–3, 5-review)
 templates/template_ref.md     reference skeleton (Part 4, Part 5-concept)
 days/dayNN_<slug>.py          the working file — user edits Part 1 and Part 3
-days/dayNN_<slug>_ref.md      reference answers + trap explanation (sealed)
+refs/dayNN_<slug>_ref.md      reference answers + trap explanation (SEALED —
+                              day 17 onward; opens only in Stage 5)
 log/problem_log_and_roadmap.md
 log/key_takeaways.md
 ```

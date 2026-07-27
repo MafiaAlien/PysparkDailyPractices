@@ -12,7 +12,7 @@ the analysis before committing destroys the exercise. Do not proceed.
 ## Steps, in this order
 
 1. Read `days/day$ARGUMENTS*.py` in full (Parts 1–3). Do **not** open
-   `_ref.md` yet.
+   `refs/day$ARGUMENTS*_ref.md` yet.
 
 2. Review the AI code **by reading only**, before running anything. Produce
    your own findings list sorted by severity:
@@ -22,7 +22,7 @@ the analysis before committing destroys the exercise. Do not proceed.
 3. Run the harness with the Stage-4 lines uncommented. Report actual
    PASS/FAIL for all four: user-DSL, user-SQL, AI-DSL, AI-SQL.
 
-4. **Now** read `days/day$ARGUMENTS*_ref.md`.
+4. **Now** read `refs/day$ARGUMENTS*_ref.md`.
 
 5. Debrief in this order:
 
