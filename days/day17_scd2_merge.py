@@ -102,7 +102,76 @@ class Solution:
         changed_at); the hard part is deciding what counts as a new version.
         """
         # TODO: implement
-        pass
+        window_date = Window.partitionBy('product_id').orderBy('changed_at')
+
+        add_prev = (
+            df.withColumn(
+                'prev_category',
+                F.lag(F.col('category'), 1).over(window_date)
+            )
+            .withColumn(
+                'prev_price',
+                F.lag(F.col('price'), 1).over(window_date)
+            )
+        )
+
+        change_cond = (F.struct(F.col('category'), F.col('price')) != F.struct(F.col('prev_category'), F.col('prev_price')))
+
+        add_flag = (
+            add_prev.withColumn(
+                'is_changed',
+                F.when(
+                    change_cond, 
+                    1).otherwise(0)
+            )
+        )
+
+        add_boundary = (
+            add_flag.withColumn(
+                'boundary',
+                F.sum('is_changed').over(window_date)
+            )
+        )
+
+        window_end = Window.partitionBy('product_id').orderBy('boundary')
+
+
+
+        get_updates = (
+            add_boundary.groupBy(
+                'product_id',
+                'boundary'
+            )
+            .agg(
+                F.min('changed_at').alias('effective_from'),
+                F.max('category').alias('category'),
+                F.max('price').alias('price')
+            )
+            .withColumn(
+                'next_date',
+                F.lead(F.col('effective_from')).over(window_end)
+            )
+            .withColumn(
+                'effective_to',
+                F.when(F.col('next_date').isNotNull(), F.col('next_date'))
+            )
+            .withColumn(
+                'is_current',
+                F.when(F.col('effective_to').isNotNull(), False).otherwise(True)
+            )
+            .select(
+                'product_id',
+                'effective_from',
+                'effective_to',
+                'category',
+                'price',
+                'is_current'
+            )
+        )
+
+        return get_updates
+
+
 
     def solve_sql(self, spark: SparkSession, df: DataFrame) -> DataFrame:
         """Spark SQL approach.
@@ -114,9 +183,177 @@ class Solution:
 
         sql = """
             -- write your SQL here
+            WITH 
+            get_prev AS (
+                SELECT 
+                    product_id,
+                    changed_at,
+                    category,
+                    price,
+                    LAG(category)OVER(partition by product_id order by changed_at) AS prev_category,
+                    LAG(price)OVER(partition by product_id order by changed_at) AS prev_price
+                FROM 
+                    product_feed
+            ),
+
+            flag_change AS (
+                SELECT
+                    product_id,
+                    changed_at,
+                    category,
+                    price,
+                    CASE WHEN struct(category, price) <> struct(prev_category, prev_price) THEN 1 ELSE 0 END AS is_changed
+                FROM 
+                    get_prev
+            ),
+
+            set_boundary AS (
+                SELECT 
+                    product_id,
+                    changed_at,
+                    category,
+                    price,
+                    SUM(is_changed)OVER(partition by product_id order by changed_at) AS boundary
+                FROM 
+                    flag_change),
+
+            agg_effective_date AS (
+                SELECT 
+                    product_id,
+                    boundary,
+                    MIN(changed_at) AS effective_from,
+                    MAX(category) AS category,
+                    MAX(price) AS price
+                FROM 
+                    set_boundary
+                GROUP BY product_id, boundary),
+
+            get_next AS (
+                SELECT 
+                    product_id,
+                    effective_from,
+                    LEAD(effective_from)OVER(partition by product_id order by boundary) AS next_date,
+                    category,
+                    price,
+                    CASE WHEN 
+                        LEAD(effective_from)OVER(partition by product_id order by boundary) IS NULL THEN TRUE
+                        ELSE FALSE END AS is_current
+                FROM 
+                    agg_effective_date                
+            )
+
+            SELECT * FROM get_next;
         """
         return spark.sql(sql)
 
+
+def ai_solve_dsl(df: DataFrame) -> DataFrame:
+    w_feed = Window.partitionBy("product_id").orderBy("changed_at")
+    w_run = w_feed.rowsBetween(Window.unboundedPreceding, Window.currentRow)
+ 
+    prev_category = F.lag("category").over(w_feed)
+    prev_price = F.lag("price").over(w_feed)
+ 
+    is_new_version = (
+        prev_category.isNull()
+        | (prev_category != F.col("category"))
+        | (prev_price != F.col("price"))
+    )
+ 
+    flagged = df.withColumn("_is_new", is_new_version.cast("int"))
+    grouped = flagged.withColumn("_version", F.sum("_is_new").over(w_run))
+ 
+    versions = grouped.groupBy("product_id", "_version").agg(
+        F.min("changed_at").alias("effective_from"),
+        F.min("category").alias("category"),
+        F.min("price").alias("price"),
+    )
+ 
+    w_version = Window.partitionBy("product_id").orderBy("effective_from")
+    result = versions.withColumn(
+        "effective_to", F.lead("effective_from").over(w_version)
+    ).withColumn("is_current", F.col("effective_to").isNull())
+ 
+    return result.select(
+        "product_id",
+        "effective_from",
+        "effective_to",
+        "category",
+        "price",
+        "is_current",
+    )
+ 
+ 
+def ai_solve_sql(spark: SparkSession, df: DataFrame) -> DataFrame:
+    df.createOrReplaceTempView("_scd2_product_feed")
+ 
+    return spark.sql(
+        """
+        WITH flagged AS (
+            SELECT
+                product_id,
+                changed_at,
+                category,
+                price,
+                CASE
+                    WHEN LAG(category) OVER (
+                             PARTITION BY product_id ORDER BY changed_at
+                         ) IS NULL
+                      OR LAG(category) OVER (
+                             PARTITION BY product_id ORDER BY changed_at
+                         ) <> category
+                      OR LAG(price) OVER (
+                             PARTITION BY product_id ORDER BY changed_at
+                         ) <> price
+                    THEN 1
+                    ELSE 0
+                END AS is_new
+            FROM _scd2_product_feed
+        ),
+        runs AS (
+            SELECT
+                product_id,
+                changed_at,
+                category,
+                price,
+                SUM(is_new) OVER (
+                    PARTITION BY product_id
+                    ORDER BY changed_at
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS version_no
+            FROM flagged
+        ),
+        versions AS (
+            SELECT
+                product_id,
+                version_no,
+                MIN(changed_at) AS effective_from,
+                MIN(category)   AS category,
+                MIN(price)      AS price
+            FROM runs
+            GROUP BY product_id, version_no
+        ),
+        bounded AS (
+            SELECT
+                product_id,
+                effective_from,
+                LEAD(effective_from) OVER (
+                    PARTITION BY product_id ORDER BY effective_from
+                ) AS effective_to,
+                category,
+                price
+            FROM versions
+        )
+        SELECT
+            product_id,
+            effective_from,
+            effective_to,
+            category,
+            price,
+            effective_to IS NULL AS is_current
+        FROM bounded
+        """
+    )
 
 # =====================================================================
 # Part 2 — Tests
@@ -185,8 +422,8 @@ if __name__ == "__main__":
     # Stage 4 — run the AI solution through the SAME harness.
     # Un-comment only AFTER committing a VERDICT in Part 3.
     # ------------------------------------------------------------------
-    # check(ai_solve_dsl(df), expected, "AI-DSL (post-review verification)")
-    # check(ai_solve_sql(spark, df), expected, "AI-SQL (post-review verification)")
+    check(ai_solve_dsl(df), expected, "AI-DSL (post-review verification)")
+    check(ai_solve_sql(spark, df), expected, "AI-SQL (post-review verification)")
 
     spark.stop()
 
@@ -204,25 +441,25 @@ if __name__ == "__main__":
 #
 # REVIEW_NOTES (fill in BEFORE running):
 # ----------------------------------------------------------------------
-# [ ] Correctness — ties? nulls? empty groups? duplicate keys? boundary rows?
+# [pass] Correctness — ties? nulls? empty groups? duplicate keys? boundary rows?
 #     notes:
-# [ ] API usage — wrong signatures, hallucinated functions, deprecated calls,
+# [pass] API usage — wrong signatures, hallucinated functions, deprecated calls,
 #     ambiguous column references in joins, SQL syntax slips?
 #     notes:
-# [ ] ANSI behavior — does any COALESCE/fallback assume a NULL that ANSI mode
+# [pass] ANSI behavior — does any COALESCE/fallback assume a NULL that ANSI mode
 #     will not deliver (element_at, array index, cast, division)?
 #     notes:
-# [ ] Performance — extra Exchange? extra scan? window without partitionBy?
+# [pass ] Performance — extra Exchange? extra scan? window without partitionBy?
 #     (do NOT guess — this is a reading-stage hypothesis, verified later)
+#     notes: because AI did not use F.when, so AI added prev.isNull() in conditions
+# [pass] Robustness — hardcoded values, assumptions not in the problem statement?
 #     notes:
-# [ ] Robustness — hardcoded values, assumptions not in the problem statement?
-#     notes:
-# [ ] Style/clarity — would you approve this in a real code review?
+# [pass] Style/clarity — would you approve this in a real code review?
 #     notes:
 #
-# VERDICT (commit before running): PASS / FAIL — because:
-# ACTUAL RESULT (after Stage 4 run):
-# GAP ANALYSIS: did the run reveal anything the reading missed?
+# VERDICT (commit before running): PASS — because: same logic as my solution
+# ACTUAL RESULT (after Stage 4 run): passed
+# GAP ANALYSIS: did the run reveal anything the reading missed? No gap
 
 
 # =====================================================================

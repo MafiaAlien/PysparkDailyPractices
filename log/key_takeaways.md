@@ -1,4 +1,4 @@
-# 累积要点 (Day 1-16)
+# 累积要点 (Day 1-17)
 
 > 术语、API 名、函数名、报错类名一律保留英文;正文用中文。
 
@@ -366,6 +366,38 @@
   先把它和写下来的规格对齐(当规格本身就是用 session_window 的语言写的时候
   它才是对的工具,尤其是流式场景)。
 
+## SCD2 / 区间闭合 (Day 17)
+- **一个版本是一段 run,不是一行**。SCD2 本质就是换了谓词的 gaps-and-islands:
+  Day 13 的边界是"时间间隔 > 阈值",这里的边界是"属性与前一行不同"——
+  **同一副骨架,可插拔的边界条件**。feed 行的粒度和版本的粒度不同,
+  而"无变化的重发行"正是两者分叉的那一行。
+- **边界检测必须是位置式的,永远不能是值集式的**。`lag` vs 当前行是契约。
+  `distinct` / `dropDuplicates` 作用在属性列上会静默合并**不相邻**的重复值
+  (`A -> B -> A` 变成两个版本而不是三个)——和"重发行"是两个不同的 bug,
+  但同一条纪律能同时挡住。
+- **半开区间 `[from, to)` 不需要任何日期算术**:`effective_to =
+  lead(effective_from)`,没有 `date_sub(...,1)`,也没有 `date_add`。
+  闭区间规格(`to = 下一个 from - 1 天`)才是 off-by-one 的产地,而且那个 `-1`
+  的粒度(天?秒?)是**规格问题不是代码问题**——动手前先把用哪种约定钉死。
+- **`is_current` 是 `effective_to IS NULL`,是派生量,不是第二个窗口**。
+  `row_number() desc = 1` 或 `max(changed_at)` 会为了得到同一个事实再排一次序。
+  区间一闭上,这个标志就是免费的。
+- **窗口函数不能出现在 `WHERE` / `HAVING`**,两套 API 都一样。实测:
+  `df.where(<含 lag 的表达式>)` -> `AnalysisException: It is not allowed to
+  use window functions inside WHERE clause`。必须先 `withColumn` 物化
+  (SQL 侧就是必须先有一个 CTE)。这是分析期错误,优化器不会救你。
+- 两条等价路线,取舍点很清楚:**A 塌成版本级**(running sum -> groupBy ->
+  lead)是**通用形式**——一旦版本级需要 run 内的聚合(run 里有几行 feed、
+  run 内 max(price)),只有 A 写得出来;**B 过滤到版本起始行**(边界行本身
+  就是版本的完整记录 -> 直接 lead)节点更少,但表达不了 run 内聚合。
+  **下游形状反过来约束上游标记的语义**:A 路线下 flag 取 0/1/NULL 都不影响
+  分组(running sum 只要求在 run 内恒定、跨边界递增);B 路线下每个 key 的
+  **首行必须被标成边界**,否则第一个版本静默消失。
+- 承接 Day 13 记的边界式 `prev IS NULL OR gap > threshold`:那个
+  `prev IS NULL` 前缀在 null-safe 谓词下**可以整个去掉**——
+  `~(c.eqNullSafe(lag(c)) & p.eqNullSafe(lag(p)))` 在首行天然为 true。
+  少一个手写守卫,就少一个守漏的机会(见 Review 启发式里的对应条)。
+
 ## 窗口 frame 机制: ROWS vs RANGE,以及哪些函数受 frame 影响
 - frame 是 **window spec 的一部分**,在 .over() **之前**构建在
   Window/WindowSpec 上:Window.partitionBy(...).orderBy(...).rowsBetween(a,b),
@@ -603,6 +635,19 @@
   的 logical plan 里 `windowspecdefinition(...)` 直接告诉你窗口**实际**按什么排序、
   frame **实际**是什么,比文案准得多(Day 15:文案说"DATE 不支持 BIGINT",
   plan 才显示出窗口仍按 sale_date 排序、day_num 白加了)。
+- **走 HashAggregate 还是 SortAggregate,由聚合 buffer 的类型决定,不由 key 决定**
+  (Day 17 实测,扩展 Day 16 的 `min(struct(...))` 记录):隔离 A/B——grouping key
+  完全不变,只改聚合列表——`min(date)` / `min(double)` -> HashAggregate ×2;
+  加一个 `min(STRING)` -> **SortAggregate ×2**(变长 buffer 进不了定长的
+  unsafe row)。修法:当那些列在组内**本来就是常量**时,把它们从 agg 挪进
+  **grouping key**,HashAggregate 就回来了(实测复现)。所以"字符串 min/max"
+  是读计划时的一个具体触发点,不只是 struct。
+- **聚合的输出有序性可以被下游 window 复用**(Day 17 实测):`SortAggregate` /
+  `HashAggregate` 之后如果接一个 window,该 window 的 `orderBy` 是 grouping key
+  的**前缀**时不插新的 `Sort`,否则要插。Day 17 里用户按 `boundary`(= grouping
+  key 之一)排序 -> 2 个 Sort;AI 按 `effective_from`(聚合产物)排序 -> 3 个 Sort。
+  两者 Exchange 都是 1,**唯一的计划差异就是这个 Sort**——又一次"别把结论记成
+  shuffle 数量,要记成每个 stage 的重量"。
 
 ## API 风格约定
 - 纯列引用(select/groupBy/on)-> 用普通字符串;当列参与表达式(比较、算术、
@@ -650,6 +695,31 @@
   NULL,所以无害;但要养成问一句的习惯——**这个 NULL 有几个来源?规格对每个
   来源要的是不是同一个值?** 要区分就需要 n_offers 或 grouping 位这类额外信号,
   单凭 `IS NULL` 不够(Day 10 / Day 12 的同一条纪律换到了 join 轴上)。
+
+## 复合类型的比较语义 (Day 17 实测)
+- **struct 之间的 `=` / `<>` 是逐字段且 null-safe 的**,和标量完全不同:
+  字段里的 NULL **等于** NULL,结果永远是 true/false,**永不返回 NULL**。
+  实测(Spark 4.1.1):`struct('a',NULL) = struct('a',NULL)` -> **true**
+  (标量的 `NULL = NULL` 是 UNKNOWN);`struct(NULL,NULL) <> struct('a',1.0)`
+  -> true;而对照的 `lc=rc AND lp=rp` 在同样五行里有四行是 NULL。
+  所以 **`struct(a,b) <> struct(c,d)` 不是 `a<>c OR b<>d` 的等价改写**——
+  前者自带 null-safe,后者要靠三值逻辑。排序上 NULL 排最前,逐字段比,
+  第一个分出胜负的字段决定结果。
+- **"字段全为 NULL 的 struct" ≠ "NULL 的 struct"**:`struct(NULL,NULL) IS NULL`
+  返回 **false**。这个区别决定了 lag 放在哪一层:
+  * `struct(lag(c), lag(p))` —— 外壳还在,字段是 NULL,分区首行比较得 **true**
+  * `lag(struct(c,p))` —— 整个 struct 是 NULL,顶层三值逻辑,首行得 **NULL**
+  同一个"封装成 struct"的想法,**lag 在里面还是在外面,首行答案相反**。
+- 推论:在 struct 上 `=` 和 `<=>` **只在顶层可能为 NULL 时**才有区别;
+  字段级的 null-safe 是 `=` 自带的,不需要 `<=>`。这是 Day 16 那张 NULL 语义
+  总表缺的一格——当时只考察了标量层面,没碰过复合类型把 null-safe 内建进
+  比较运算这一层。
+- SQL 侧还有一个同形写法:**row constructor** `(c1, p1) <> (c2, p2)` 能直接跑,
+  行为与 `struct(...) <> struct(...)` 一致(实测)。但它**只是 SQL 解析器的语法**
+  ——DSL 里 `(a, b)` 是 Python tuple,没有任何 Spark 语义,会在
+  `Column.__bool__` 上抛 `CANNOT_CONVERT_COLUMN_INTO_BOOL`。DSL 里写
+  `F.struct(...) != F.struct(...)`。(Day 15"SQL 能跑不等于 DSL 同形写法能跑"
+  的又一例,失败方式不同:那次是类型契约,这次是根本不存在这个语法。)
 
 ## 哨兵路线 vs `<=>` 路线 —— 四维取舍 (Day 16)
 - **哨兵(sentinel)= 用一个值域里不可能出现的普通值顶替 NULL**,让 NULL 从此
@@ -950,3 +1020,19 @@
 - **测计划前先确认被测算子还活着**(Day 16):列裁剪会删掉输出未被使用的算子
   (实测中整个 `Window` 消失),于是你量到的是一个假计划。**让被测算子的输出
   真正参与最终结果**,再去数 Exchange。
+- **"补守卫式"的比较谓词:先数守卫和被比较列是否一一对应**(Day 17)。
+  看到 `x.isNull() | (x != y) | (p != q)` 这种形状,作者是在用裸 `!=` 加手工
+  NULL 守卫。**只守了一部分列的,就是 bug**:剩下那列一旦为 NULL,整条 OR 链
+  塌成 NULL,而三值逻辑**不报错**——它会静默改变下游。Day 17 实测:AI 只守了
+  `prev_category` 没守 `prev_price`,一个 NULL price 之后 running SUM 冻结,
+  四行塌成一个版本(正确答案是三个)。对照写法(`eqNullSafe` / struct 比较)
+  **从构造上就不产生 NULL**,没有守漏的可能。**靠读就能抓到**,而且题面保证
+  "属性永不为 NULL"时测试数据**永远**测不到——属于"两边全绿却在缺失输入上
+  分歧"那一类(同 Day 15 `=0` vs `>0`)。
+- **一个防御分支从不触发,可能不是"防御",而是你没搞清自己的谓词**(Day 17)。
+  `F.when(cond, 1).otherwise(0)` 里的 `.otherwise(0)` 只有 cond 可能为 NULL/false
+  时才有意义。Day 17 里用户以为这个 `.otherwise(0)` 在兜住首行的 NULL,实测
+  首行 flag = **1** —— 因为 struct 比较是 null-safe 的,那个分支是**死代码**。
+  落地动作:**别推断谓词的取值,把中间列 `.show()` 出来逐行看**(Day 13 已记过
+  "running sum 不对时先看 flag 列",这里是同一动作用于**确认自己的心智模型**
+  而不是找 bug)。搞错这一点的代价不是错误答案,是**在 review 里把因果讲反**。
