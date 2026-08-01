@@ -18,7 +18,26 @@ EXPECTED OUTPUT
 
 EXAMPLE
 -------
-<Input rows and expected output rows.>
+Render every table as a df.show()-style ASCII box with a header row — one
+box per input table, one for the expected output. Never as bare tuples.
+
+<table_name>:
+
+    +-------+-------+-------+
+    | col_a | col_b | col_c |
+    +-------+-------+-------+
+    | ...   | ...   | ...   |
+    +-------+-------+-------+
+
+Expected:
+
+    +-------+-------+
+    | out_a | out_b |
+    +-------+-------+
+    | ...   | ...   |
+    +-------+-------+
+
+Per-row annotations go under the box as notes, not inside cells.
 
 WORKFLOW (v2)
 -------------

@@ -42,6 +42,11 @@ Generate the next day's practice problem. Do **not** solve it.
 - Part 3 stays empty — checklist comments only, never a pre-filled solution.
 - Part 5 in the day file contains only the unanswered "Review takeaways"
   prompts. Concept takeaways go in `refs/dayNN_<slug>_ref.md`.
+- The EXAMPLE section renders every table as a `df.show()`-style ASCII box
+  with a header row — one box per input table, one for the expected output.
+  Never bare tuples or prose rows: without column headers the reader cannot
+  tell which value is which column. Per-row annotations (e.g. why a row is
+  the interesting one) go under the box as notes, not inside the cells.
 - Test data: ≤ 15 rows, including the trap rows. Small enough to reason about
   by hand.
 - `expected` must be hand-derived row by row, not produced by running a

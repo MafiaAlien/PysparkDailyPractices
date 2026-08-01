@@ -1,4 +1,4 @@
-# 累积要点 (Day 1-17)
+# 累积要点 (Day 1-18)
 
 > 术语、API 名、函数名、报错类名一律保留英文;正文用中文。
 
@@ -178,6 +178,14 @@
   COUNT"(count -> countDistinct(id))的姊妹条。
 - countDistinct 比 count 贵(expand / 两阶段聚合,map 端 partial agg 更弱)
   ——这是 explode 路线的隐藏成本;用 explain() 验证,别凭记忆。
+  **(Day 18 实测精化:"expand"只对**多个** distinct 成立。单个
+  `COUNT(DISTINCT x)` 的计划里**没有 Expand 节点**,它被重写成两层堆叠的
+  HashAggregate ——先 `(分组键, x)` 粒度、再 `(分组键)` 粒度。同一份数据实测:
+  单 distinct = **0 个 Expand / 2 个 Exchange**,两个 distinct = **1 个 Expand /
+  4 个 Exchange**。而且它贵不贵**取决于继承到的分区**:上游按 `customer_id`
+  分区时,那两层之间**不插 Exchange**(子集规则满足);上游按 `(customer_id, salt)`
+  分区时要多插一个。所以"countDistinct 更贵"必须落到具体上游,它不是常数代价。
+  在计划里读到 `partial_count(distinct ...)` 就当成一个便宜的单算子,是这里的错误。)**
 
 ## Struct
 - 嵌套字段访问:device.os / F.col("device.os") / df["device"]["os"] 三者
@@ -642,6 +650,13 @@
   unsafe row)。修法:当那些列在组内**本来就是常量**时,把它们从 agg 挪进
   **grouping key**,HashAggregate 就回来了(实测复现)。所以"字符串 min/max"
   是读计划时的一个具体触发点,不只是 struct。
+  **第三个算子:`collect_set` / `collect_list` 走 `ObjectHashAggregate`**
+  (Day 18 实测:collect_set 路线全程 ObjectHashAggregate x4,对照路线全程
+  HashAggregate)——buffer 里保存任意 JVM 对象,超过
+  `spark.sql.objectHashAggregate.sortBased.fallbackThreshold` 后回退到 sort-based
+  溢写。至此三个算子、三种 buffer 形态,**"由聚合函数列表决定、不由 grouping key
+  决定"这条规律第三次成立**(Day 16 `min(struct)` -> SortAggregate、Day 17
+  `min(STRING)` -> SortAggregate、Day 18 collect_set -> ObjectHashAggregate)。
 - **聚合的输出有序性可以被下游 window 复用**(Day 17 实测):`SortAggregate` /
   `HashAggregate` 之后如果接一个 window,该 window 的 `orderBy` 是 grouping key
   的**前缀**时不插新的 `Sort`,否则要插。Day 17 里用户按 `boundary`(= grouping
@@ -845,6 +860,68 @@
 - 记账:链式那个多出来的 Exchange 搬的是**已聚合**的数据(每 key 一行),很轻。
   别为了躲它去扭曲代码结构——真正值得动手的还是"源表被 Scan 了几次"。
 
+## 数据倾斜:加盐与两阶段聚合 (Day 18 实测)
+- **加盐是物理布局干预,爆炸半径却在语义上。** 它不改变算什么,只改变在哪里算
+  ——正确性代价**全部**集中在重组步骤:每个度量都必须在"组的任意划分"上可分解。
+  判据一句话:**f(A ∪ B) 能否只由 f(A) 和 f(B) 算出?**
+  * 可以:`SUM` / `COUNT` / `MIN` / `MAX` / `collect_set`
+  * 不可以:`COUNT(DISTINCT)`、`AVG` 作为均值的均值、`MEDIAN` / 任何百分位、
+    `FIRST` / `LAST`
+  两阶段聚合里**每个**度量都要独立过这道关。Day 18 的 `total_amount`(SUM)和
+  `n_products`(DISTINCT)在同一个 agg 里,一个对一个错,输出是**半对的一行**
+  ——钱对、基数错(热点键实测 8,正确 4)。而失败**只落在热点键上**,也就是你
+  当初之所以要加盐的那个键。
+- **不可分解的度量有两条正解**,都不是"再包一层 SUM":
+  * 每桶 `collect_set` -> `flatten` -> `array_distinct` 求并 -> `size` 计数。
+    集合并可分解,这就是全部内容。`array_distinct` **承重**,不是防御代码
+    ——collect_set 只在桶内去重,跨桶正是陷阱本身(Day 15/16"承重 vs 死代码"
+    判别练习的又一例,这次答案是**承重**)。
+  * 把去重列放进 partial 的**分组键**,让第二阶段做一次真正的 COUNT(DISTINCT)。
+- **盐必须是"行"的函数,不能是"键"的函数。** `pmod(hash(join_key), N)` 对同一个
+  key 恒定 -> 热点一行没被打散、维度侧还白白复制 N 倍。实测:热点 8 行全落同一桶;
+  换成 `pmod(order_id, N)` 才分成 3/3/2。**代码形状完全正确,效果为零。**
+- **加盐必然多付一个 Exchange,原因是结构性的。** 加盐后的 stage 按 `(key, salt)`
+  分区,最终聚合按 `(key, ...)` 分组 —— `salt` 在分区键里、不在分组键里,子集判定
+  必然失败(即"Exchange 复用的判定"一节的场景 3,第三次确认)。**去掉盐正是最终
+  阶段存在的意义,所以这笔税任何加盐方案都躲不掉。** 反过来 partial 阶段是**免费**
+  的:join on `(key,salt)` 之后 `groupBy(key, seg, salt)` 满足子集,不加 Exchange。
+- **实测账**(Spark 4.1.1,`autoBroadcastJoinThreshold=-1`;不关的话 5 行维表被
+  广播、两个 join Exchange 全消失,什么都看不见):
+
+  | 路线 | Exchange | 聚合算子 |
+  |---|---|---|
+  | 不加盐基线 | **2** | HashAggregate x4 |
+  | 加盐 + collect_set | **3** | ObjectHashAggregate x4 |
+  | 加盐 + product 进 partial 键 | **4** | HashAggregate x6 |
+
+  **不加盐那条 Exchange 最少。** 加盐是拿"多一次 shuffle + 更宽的中间结果"换
+  "一个本来会拖垮单 task 的键能跑完";在测试规模的数据上它是**纯开销**——它的
+  正确性代价必须由**实测到的倾斜**买单,不能凭反射动手。
+- **只给热点键加盐、冷键固定盐 0**(实操优化,参考答案未覆盖):无差别加盐时
+  维度侧膨胀恰好是 `dim_rows x N`,一张千万行维表按 N=50 复制是灾难。选择性加盐
+  的不变量:事实侧冷键固定给 0,维度侧冷键只复制盐 0(热键才复制 0..N-1)。
+  代价是要先算出热点名单,**且两侧名单必须严格一致**——事实侧按热键散成 0..N-1
+  而维度侧只复制了 0,那些行会在 inner join 里**静默消失**。
+- **AQE 的 skew join 与手工加盐解决重叠但不同的问题。**
+  `spark.sql.adaptive.skewJoin.enabled` 挂在 sort-merge / shuffled-hash join 的
+  **shuffle 读**上,把超大分区切片并复制另一侧的对应分区——机制上就是运行时版的
+  replicate-and-fan-out。它**救不了**:broadcast join(没有 shuffle 可重读)、
+  以及**倾斜的 groupBy**(聚合没有"另一侧"可复制)。**聚合倾斜只有手工加盐一条路**,
+  而这正是 Day 18 这道题建立在其上的场景。触发门槛是**两道且必须同时满足**:
+  分区 > `skewedPartitionThresholdInBytes`(默认 256MB)**且** >
+  `skewedPartitionFactor`(默认 5.0)x 中位数。推论:**一张 100MB 表上 5 倍的
+  倾斜,AQE 完全不管**——它故意忽略只是"相对"的倾斜。
+- **`rand()` 加盐的通行说法是错的**(Day 18 实测):无 seed 的 `F.rand()` 在
+  **构造表达式时**就固化 seed 并印进计划
+  (`FLOOR((rand(-8997242134998194276) * 3.0))`),所以同一个 DataFrame 反复
+  action **值是稳定的**,跨 shuffle 也稳定。它不稳定的是**独立构造的两个
+  `rand()` 列**——那永远不会相等。所以真实失效路径不是"task retry 打乱你的
+  join",而是:(a) 任何**两侧各自加盐**的方案从一开始就错;(b) 两次运行不可复现,
+  错误结果无法 diff;(c) 上面那个不可分解陷阱会变成**非确定性地错**而不是稳定地错。
+  `pmod(stable_id, N)` 不花任何代价消掉这三条。附带的性能事实:
+  **非确定性表达式挡住谓词下推**——实测同一个 filter,`pmod` 版 Filter 沉到
+  Project 之下,`rand` 版留在其上。
+
 ## 修正:rank-filter window 有 map 端缩减 (Day 16,限定 Day 7 的记录)
 - 旧记录:"window 的第二阶段是对每行做完整 SORT + Window,没有 partial-agg
   缓解"。在 **`row_number() = 1` / `rk <= k` 这类 top-k 过滤**下**不成立**:
@@ -1036,3 +1113,14 @@
   落地动作:**别推断谓词的取值,把中间列 `.show()` 出来逐行看**(Day 13 已记过
   "running sum 不对时先看 flag 列",这里是同一动作用于**确认自己的心智模型**
   而不是找 bug)。搞错这一点的代价不是错误答案,是**在 review 里把因果讲反**。
+- **看到加盐代码,先问"同一个 key 的行会不会拿到不同的盐"**(Day 18):任何
+  `salt = f(...)`,若 `f` 的输入只有 join key / 分组键,它对每个 key 就是常量
+  ——热点一行没被打散,而代码形状、计划形状**全都正确**。落地动作:**加盐代码
+  通过测试时,把盐换成行级列再跑一次;行数变了就说明第二阶段是缺的。** Day 18 里
+  "盐取自 join key"和"缺最终聚合"两个 bug 互相抵消,四行全绿(换盐后 4 行 -> 7 行)。
+- **`approx_*` 家族出现在有精确期望值的测试里,判"测试数据分辨不出",不判 pass**
+  (Day 18):`approx_count_distinct` / `percentile_approx` / 任何带 `rsd` 或
+  `accuracy` 参数的聚合,在低基数上**退化为精确**(实测基数 <=4 时与 countDistinct
+  逐行相同,默认 rsd=0.05)。小测试集**永远**分辨不出它与精确版本,而规格要精确值时
+  它是一个**契约错误**。同族:Day 15 `=0` vs `>0`、Day 17 的 NULL 守卫——"两边全绿,
+  却在测试数据缺失的输入上分歧"。

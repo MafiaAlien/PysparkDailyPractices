@@ -24,10 +24,21 @@
       "Bash(spark-submit *)",
       "Read(./log/**)",
       "Read(./templates/template_v2.py)"
-    ],
-    "deny": [
-      "Edit(./refs/**)",
-      "Edit(./days/*_ref.md)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/protect_sealed_refs.sh\"",
+            "timeout": 10,
+            "statusMessage": "Checking sealed reference files"
+          }
+        ]
+      }
     ]
   }
 }
