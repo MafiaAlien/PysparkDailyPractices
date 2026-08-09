@@ -85,7 +85,14 @@
   array_sort。
 - sort_array vs array_sort:都默认升序;区别在 NULL 的位置(前 vs 后)和
   附加能力(bool 降序标志 vs lambda comparator,3.0+)。
-- SIZE(NULL) = -1(遗留怪癖)——可空数组要 COALESCE 兜底。
+- **~~SIZE(NULL) = -1(遗留怪癖)~~ 这句在 Spark 4.x 上是错的**(Day 19 实测修正):
+  `size(CAST(NULL AS array<int>))` 返回 **NULL**。-1 的行为由
+  `spark.sql.legacy.sizeOfNull` 控制,但**生效值是它与 `!ansi.enabled` 的与**
+  ——4.x 里 ANSI 默认开,所以即使 `spark.conf.get("spark.sql.legacy.sizeOfNull")`
+  读出来仍是 `"true"`,实际拿到的仍然是 NULL。**照 conf 读数下判断会二次踩坑:
+  要看的是生效值,不是 conf 值。** 后果:`size(arr) > 0` 这个守卫在 NULL 数组上
+  求值为 **NULL 而不是 false**(实测),布尔输出列会是 NULL 不是 False。
+  可空数组仍要兜底,但兜的是 NULL 不是 -1。
 
 ## 聚合函数的 NULL 语义
 - **所有**聚合函数(count/sum/avg/collect_list/collect_set...)都忽略
@@ -602,6 +609,63 @@
   element_at(arr, i) 是 **1-based**。在一个表达式里混用 `kv[0]` 和
   `element_at(..., 1)` 合法且能跑通,但在 review 中是实打实的可读性缺陷。
 
+### 空集合单位元 —— 本主题的靶心 (Day 19 实测)
+- `forall([]) = true`(AND 单位元)、`exists([]) = false`(OR 单位元)、
+  `size([]) = 0`、`aggregate([], z, ...) = z`。**四个里三个符合直觉,只有
+  `forall` 不符合**——这就是它成为唯一被写坏的那个的原因。实测
+  `SELECT forall(array(), x -> x), exists(array(), x -> x)` -> `true, false`。
+- **"空数组"、"空分组"、"LEFT join 后的缺行"是三个不同的对象、三套不同的默认值。**
+  同一句"对 S 中所有 x":`forall` 在 `S = []` 上给 **true**;`bool_and` / `min`
+  在**零行分组**上给 **NULL**;LEFT join 之后那一行**根本不存在**。写之前先确认
+  自己身处哪一种编码。呼应 Day 4(空数组行在 explode 下消失)与 Day 16
+  (`COUNT(*)` vs `COUNT(col)`)——Day 19 是同一问题的第三种编码,而且**符号翻转**:
+  漏掉的行是响的,错掉的布尔是哑的。
+- 由此:`size(active) > 0 AND forall(active, ...)` 里的第一个连接词是**承重**,
+  不是防御性代码。判据仍是 Day 15/16 那条——"去掉它,**具体哪一行**会变?"
+- 反过来,同一个守卫在 explode + 条件聚合的路线里是**死代码**(那边由
+  `COALESCE(..., false)` 承重)。**"要不要防御由你选的结构决定,不由规格决定"
+  第三次成立**(Day 15、Day 16、Day 19)。
+
+### aggregate 的 zero 值钉死累加器类型 (Day 19 实测)
+- merge lambda 必须**恰好**返回 zero 的类型,**没有隐式加宽**。三种写法全部在
+  分析期抛 `AnalysisException [DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE]`:
+
+  | 写法 | 报错里说的 zero 类型 |
+  |---|---|
+  | DSL `F.aggregate(arr, F.lit(0), lambda a,x: a + <double>)` | `INT` |
+  | SQL `aggregate(arr, 0, (a,x) -> a + <double>)` | `INT` |
+  | SQL `aggregate(arr, 0.0, (a,x) -> a + <double>)` | **`DECIMAL(1,1)`** |
+
+  最后一行是坑:**SQL 里裸字面量 `0.0` 不是 double,是 `DECIMAL(1,1)`**。
+  正确写法:DSL `F.lit(0.0)`,SQL `CAST(0 AS DOUBLE)` 或 `0.0D`。
+- 这是**响的失败,不是静默的**——分析期就死,根本跑不到数据。但它是 `aggregate`
+  最常见的第一次报错。
+
+### DSL lambda 里取 struct 字段:用下标,不用属性 (Day 19 实测)
+- `lambda x: x["status"]` 与 `lambda x: x.status` 通常等价(后者走
+  `Column.__getattr__`),但**字段名撞上 Column 的方法名时,属性形式拿到的是方法**。
+  实测字段名为 `cast` 时:`lambda x: x.cast` 抛
+  `PySparkValueError [HIGHER_ORDER_FUNCTION_SHOULD_RETURN_COLUMN]`,
+  `lambda x: x["cast"]` 正常返回 7。撞名清单不止 `cast`:`alias` / `name` /
+  `desc` / `asc` / `when` / `over` / `between` ... **默认用下标形式。**
+- 数组参数可以直接传列名字符串:`F.filter("items", lambda x: ...)`,不必 `F.col`。
+- **字面量不需要手动 `F.lit`**:`x["status"] == "ACTIVE"` 与
+  `x["status"] == F.lit("ACTIVE")` 生成**完全相同**的表达式(`Column.__eq__`
+  自动包 lit)。写 `F.lit` 不增加任何健壮性——Day 19 的 review 里这一点被误判成
+  "AI 的写法更稳",真正更稳的是它的**下标取字段**,不是它的 `F.lit`。
+
+### HOF 路线 vs explode 路线的计划形状 (Day 19 实测)
+- **反范式数组上,HOF 路线是 0 Exchange 的**:任何"每 key 一个度量"只要写得成
+  "一行内对一个数组的函数",整条查询就是 `Project` over `Scan`,没有 stage 边界。
+  实测三条路线:HOF **0** / `explode_outer` + 条件聚合 **1** / `explode` + WHERE
+  + groupBy + LEFT join 回卷 **2** + broadcast。
+- **但这个优势属于"布局",不属于"高阶函数"**:数组已经和它的 key 同置,分组是
+  写数组的人替你做完的;`explode` + `groupBy` 是把一次免费的分组**重新买一遍**。
+  行项目一旦独立成表,explode 路线就是唯一路线。
+- B 与 B' 的差距不是抽象的"多一次 join shuffle":是 `WHERE status='ACTIVE'`
+  **摧毁了一个分组**,重建完整 key 集要多扫一次源表加它自己的 Exchange。把 ACTIVE
+  判定从 WHERE 推进聚合里(`count(when(act,1))`)就同时删掉了 join 和那次 shuffle。
+
 ## ANSI 模式决定"越界/失败"的行为 (Day 14)
 - element_at、数组下标 arr[i]、cast、除零、算术溢出:在
   spark.sql.ansi.enabled 下会**抛异常**;ANSI 关闭时静默返回 **NULL**。
@@ -663,6 +727,22 @@
   key 之一)排序 -> 2 个 Sort;AI 按 `effective_from`(聚合产物)排序 -> 3 个 Sort。
   两者 Exchange 都是 1,**唯一的计划差异就是这个 Sort**——又一次"别把结论记成
   shuffle 数量,要记成每个 stage 的重量"。
+- **表达式复用 ≠ 计算复用:Catalyst 不会替你 CSE 掉一个重复写下的子树**
+  (Day 19 实测)。把 `active = F.filter("items", ...)` 存进 Python 变量再用 5 次,
+  和**抄 5 遍是同一件事**——实测 `executedPlan` 的单个 Project 里 `filter(items`
+  出现 **5 次**。
+  * **机制**:五份拷贝的 lambda 变量 ExprId 各不相同(`x_7#18` … `x_7#22`),
+    因而彼此**不 `semanticEquals`**——plan 层 CSE 无从下手,运行时的
+    `spark.sql.subexpressionElimination` 也只补回一部分。
+  * **`withColumn("active", ...)` 命名一次是安全的,而且原因反直觉**:
+    `CollapseProject` **主动拒绝**把非廉价表达式内联到多个使用点,所以两层
+    Project 会被**保留**(实测 Project x2、`filter(items` x1),而不是被合并掉。
+  * **代价实测**(400k 行 x 12 元素,`noop` sink,min of 3):命名版 **0.83s**
+    vs 内联版 **1.17s**;关掉 subexpressionElimination 后 **0.73s vs 1.39s**
+    ——消重只补回约一半。两边 **Exchange 都是 0**:这是**每行 CPU** 的故事,不是
+    shuffle 的故事,又一次印证"Exchange 数相同时要说出真正的机制"。
+    (注:命名版还**多**背了一层 `transform`,仍然赢——那层 transform 的代价被
+    省下的四次 `filter` 完全覆盖。)
 
 ## API 风格约定
 - 纯列引用(select/groupBy/on)-> 用普通字符串;当列参与表达式(比较、算术、
@@ -1052,6 +1132,11 @@
   多一个概念要读)**,不属于 Performance。把它记在 Performance 栏会让
   review 的严重度排序失真:真正的 Performance 问题是多出来的 Exchange /
   多一次扫描 / 单分区窗口,不是多一个 withColumn。
+  **限定(Day 19 实测)**:"先数 Exchange"是**必要条件,不是充分条件**。Day 19 里
+  两条路线 Exchange **都是 0**,但把 `filter(...)` 内联 5 次的版本慢约 **40%**
+  ——纯粹的每行 CPU,Exchange 计数**根本看不见**。完整判据是两步:**先数 Exchange
+  (排除 shuffle 级问题);Exchange 相同,再数重复子树 / 每行工作量。** 只做第一步
+  会把这一类真实的 Performance 问题误判成 style——方向和 Day 15 那次**正好相反**。
 - **同一条发现在两套 API 上的结论可以相反**(Day 15):"这个天序号列是多余的"
   在 **SQL 侧成立**(SQL 的 frame 子句直接吃 DATE 列),在 **DSL 侧不成立**
   (PySpark 的 rangeBetween 必须要数值排序列,见 RANGE frame 类型约束一节)。
@@ -1124,3 +1209,22 @@
   逐行相同,默认 rsd=0.05)。小测试集**永远**分辨不出它与精确版本,而规格要精确值时
   它是一个**契约错误**。同族:Day 15 `=0` vs `>0`、Day 17 的 NULL 守卫——"两边全绿,
   却在测试数据缺失的输入上分歧"。
+- **同族的集合谓词,空集合上的默认值可以是相反的**(Day 19):读到任何对集合的
+  全称/存在判断(`forall` / `exists` / `bool_and` / `min(bool)` / `NOT EXISTS`),
+  先问两句:**这个集合能不能是空的?现在用的是哪一种"无数据"编码——空数组、
+  空分组,还是 LEFT join 后的缺行?**(三者默认值分别是 `true` / `NULL` / 行不存在。)
+  `exists` 与 `forall` 是 De Morgan 对偶、空集单位元**相反**(false / true),
+  任何**对称处理**它们的代码(都不加守卫,或只加一个)都在断言二者行为相同。
+  第二个 tell 是纯文本的:规格写了"至少有一个 X **并且** ...",两个子句,而代码里
+  只有一个子句。**靠读就能抓到。** 同族:Day 4、Day 16、Day 17——"两边全绿,却在
+  某一类输入上分歧"。
+- **同一个非平凡表达式被写了 >=2 次,不要假设 Catalyst 会消重**(Day 19):
+  看到 `filter(...)` / `transform(...)` / 标量子查询在一个 `select` 里重复出现,
+  去 `explain()` 数它在 `Project` 里出现几次,别凭直觉。**PySpark 里"存进变量再用
+  几次"和"抄几遍"是同一件事**;HOF 尤其危险——每次调用生成新的 lambda ExprId,
+  几份拷贝互不 `semanticEquals`,plan 层与运行时的消重都补不全(实测 5x 内联比
+  `withColumn` 命名慢约 40%,而 Exchange 同为 0)。
+  **附带的评审动作(本日真实漏检形状)**:用户只比对了**自己那侧**多出来的东西
+  (多一层 `transform`,实为 style),没看**对方那侧**重复的东西(5x `filter`,
+  实为 perf),于是 Performance 栏记的是自己的心事,不是对方的问题。
+  **读对方代码时,先独立数一遍重复表达式,再去比对两版的差异。**

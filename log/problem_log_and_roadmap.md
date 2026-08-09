@@ -21,6 +21,7 @@
 | 16 | NULL semantics special (null-safe equality `<=>`, NULL in joins, NULL ordering in windows / NULLS FIRST\|LAST) | Medium | Catalog × marketplace offer reconciliation: per catalog entry emit n_offers / best_seller / best_price, where a NULL `variant` is a MEANINGFUL key value (the base product, labelled 'BASE') present in BOTH tables, and an unknown price can never win best_seller | nullable join key is the whole trap: `=` on `variant` silently drops every base product, and because the join is LEFT the failure surfaces as *plausible-looking rows* (n_offers 0, best_seller 'NONE') rather than missing rows — harder to spot than dropped rows. Two grains: n_offers over ALL offers vs best over KNOWN-PRICE offers only — filter FIRST then rank. Default NULL ordering ASC -> NULLS FIRST, so a plain `orderBy(price.asc())` floats the *missing* value to rank 1. Filter-vs-`NULLS LAST` are NOT interchangeable: spec says unknown price can never win = filter semantics; `NULLS LAST` still gives rn=1 to an all-unknown-price key, and once the filter is in it degrades to DEAD CODE (Day 15 load-bearing-vs-dead COALESCE sibling). Row S2 (key exists, every price unknown) is the ONLY row separating "no match" from "matched but nothing usable" — naive code is correct on every other row. After a LEFT join `COUNT(*)` reports 1 for an empty group, `COUNT(right_col)` reports 0. Defensive code is dictated by STRUCTURE not spec: join-then-groupBy gets the zero free from `count(seller)`, groupBy-then-join must write `COALESCE(n_offers,0)` — reordering the two invalidates every NULL guard. `MIN(struct(price,seller))` is only correct AFTER NULL prices are gone (NULL sorts smallest, an unknown price wins the MIN outright). Sentinel-vs-`<=>` four-way tradeoff: sentinel collides if 'BASE' is ever legitimate + the filled key doubles as output label (test compares by position, won't catch it); `<=>` has no collision surface but must be repeated at EVERY join. PLAN (measured): `<=>` desugars into TWO ordinary equi-keys `coalesce(v,'')` + `isnull(v)` — never a nested-loop join, still broadcastable — but those are DERIVED expressions that don't match an upstream `GROUP BY sku, variant` partitioning: forced SMJ = 3 Exchanges vs sentinel 2, and AQE+broadcast erases the gap entirely (broadcast has no partitioning requirement). Sibling branches on IDENTICAL keys do NOT share an Exchange (count Scans first, then Exchanges); reuse needs same lineage AND partition-keys ⊆ required-keys — this OVERTURNS the older log/04 claim that subset also reshuffles. `WindowGroupLimit ... Partial` below the Exchange means rank-filter windows DO have map-side reduction — limits the Day 7 record |
 | 17 | Incremental patterns: SCD2 history build from a change feed (run-based versioning: lag -> boundary flag -> running SUM -> half-open interval closing) | Medium-Hard | Build the SCD2 history table from an append-only product attribute feed: one row per (product, version) with effective_from / effective_to / is_current, tracked attrs = category + price | no-op replay is the trap: a version is a *run* of feed rows, not a feed row. `lead(changed_at) OVER (partition by product_id order by changed_at)` IS the correct interval-closing idiom — it is only applied to the wrong row set, so one-row-per-version is right on every product whose consecutive rows genuinely differ (8 of 9 expected rows, 3 of 4 products correct); P1's 01-05 replay is the only exposing row, and it fails BOTH ways at once (spurious version AND the surviving interval truncated 01-01->01-05 instead of ->01-10). Adjacent, not the trap: P4 `40 -> 45 -> 40` — boundary detection must be POSITIONAL (lag vs current), never value-set-based; `dropDuplicates([id,category,price])` / DISTINCT collapses the two non-adjacent 40.0 runs and loses the third interval. Half-open `[from,to)` needs NO date arithmetic (`effective_to = lead(effective_from)`, no date_sub -1); `is_current = effective_to IS NULL` is DERIVED, a second `row_number() desc = 1` window re-sorts to learn the same fact. Window functions are ILLEGAL in WHERE/HAVING in both APIs (`AnalysisException: It is not allowed to use window functions inside WHERE clause`) — materialize via withColumn / a CTE first. AI-review: AI's change predicate `prev_category.isNull() \| (prev_cat != cat) \| (prev_price != price)` guards only ONE of the two attributes — on a NULL price the whole OR chain returns NULL, cast("int") -> NULL, running SUM skips it and FREEZES, collapsing every subsequent row into one version (measured: 4 dirty rows -> 1 version vs the correct 3). Test data can never expose it (spec guarantees non-NULL attrs). User's `F.struct(cat,price) != F.struct(prev_cat,prev_price)` was immune for a reason the user hadn't identified: struct comparison is FIELD-WISE NULL-SAFE, so the predicate never yields NULL and the `.otherwise(0)` was dead code (measured: user_flag = 1 on every product's first row, identical to AI's and the ref's). AI's explicit `ROWS` vs user/ref default `RANGE` on the running SUM: indistinguishable here only because the spec forbids duplicate changed_at per product. PLAN (measured): all 4 solutions = 1 Exchange (groupBy after a window adds none — window partitionBy ⊆ grouping keys, re-confirms Day 16); user 2 Sorts vs AI 3, because user's second window `orderBy('boundary')` reuses the aggregate's output ordering while AI's `orderBy('effective_from')` does not — an accidental win, and the ONLY plan difference. `min`/`max` on a STRING column forces SortAggregate (non-fixed-width agg buffer, extends the Day 16 `min(struct(...))` finding); moving the run-constant attrs into the grouping key (ref's route) restores HashAggregate — isolated A/B, only the agg list changed |
 | 18 | Skew handling: salted join + two-phase aggregation (pmod salt -> dimension replication via explode(sequence) -> partial/final recombination) | Medium-Hard | Per-customer summary over a skewed fact table, forced through a salted join + two-phase agg: total_amount (SUM) + n_products (DISTINCT count) | DISTINCT 计数在盐桶上**不可分解**是全题靶心:partial `COUNT(DISTINCT product)` per (cust,salt) -> final `SUM` 对每个跨桶的 product 重复计数(实测 C_HOT n_products=**8** vs 正确 **4**),而同一个 agg 里的 total_amount 因为 SUM 可分解**永远正确**——输出是**半对的一行**:钱对、基数错。四行里只有热点键暴露:C1 的 10/13/16 全满足 `id%3==1` 整个落单桶,且它是唯一有重复 product 的冷客户(专骗"重复产品处理对吗"这类检查);C2 跨两桶但两个产品互不跨桶;C3 单行。两条正解:`collect_set` -> `flatten` -> `array_distinct` -> `size`(集合并可分解,`array_distinct` 是**承重**不是防御,因为 collect_set 只在桶内去重);或把 product 放进 partial 分组键把 distinct 推迟到第二阶段。用户解法两个 bug **互相抵消**:盐取自 join key(`pmod(hash(customer_id),3)`)-> 同一客户同盐、热点 8 行全落一个桶、维度白复制 3x,且第二阶段聚合**完全缺失**(SQL 侧 `GROUP BY` 里根本没有 salt,是单阶段)——把盐换成 `pmod(order_id,3)` 立刻从 4 行变 **7 行**。`approx_count_distinct` 在基数 <=4 时与精确值逐行相同,**任何测试数据都分辨不出**(默认 rsd=0.05)。AI(= 参考 Route B)全对,未踩陷阱。PLAN(实测,broadcast off):不加盐基线 **2** Exchange / 加盐+collect_set **3** / 加盐+product 进 partial 键 **4** —— **加盐路线是最贵的**;"去盐税"那个 Exchange 由 `salt ∈ 分区键 ∉ 最终分组键` 结构性导致(Exchange 子集规则第三次确认),`COUNT(DISTINCT)` 的重写还要再按 `(keys, product)` 多插一个。AQE skewJoin 需**同时**满足 >256MB **且** >5x 中位数,14 行两条都不达标,只观察到 `AQEShuffleRead coalesced`,**没有** `OptimizeSkewedJoin` |
+| 19 | 高阶数组函数(transform / filter / exists / forall / aggregate / size,数组内原地计算) | Medium | 订单行项目以 array<struct> 反范式存储,每单出一行汇总:n_active / active_total / has_bulk / all_in_stock,禁止 explode + groupBy 回卷 | `forall([])` 返回 **true**(AND 单位元)是全题靶心:`filter(items, status='ACTIVE')` 清空数组后,零 ACTIVE 行的订单被判成"全部有货"。规格里"AT LEAST ONE ACTIVE ... AND ..."的第一个子句 `size(active) > 0` 是**承重**不是防御。同组四个度量只有它错:`size([])=0` ✓、`aggregate([],0.0D,…)=0.0` ✓、`exists([])=false`(OR 单位元)✓、`forall([])=true` ✗ —— 失败是 5x5 输出网格里的**单个格子**(O4.all_in_stock),同一行另外四列全对。唯一暴露行 O4 两行全 CANCELLED **且**两行 in_stock 都为 true(堵死"忘了 filter 也能蒙对"的后门);D2 qty=15 顺带校验 has_bulk 真的过滤了,O2.B2(CANCELLED, 20@100.0)让漏过滤在 active_total 上炸成 2048.0 而非 48.0。`aggregate` 的 zero 钉死累加器类型且**无隐式加宽**:DSL `F.lit(0)`、SQL `0`、SQL 裸 `0.0`(**DECIMAL(1,1)**,不是 double)三者全在分析期 `DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE` 死掉——响的,不是静默的。AI(= 参考 Route A)全对未踩陷阱;用户 Stage-1 也对,但**本日 trap 维度无有效信号**:用户在 Stage 1 中途直接问了"空数组怎么判",教练给了 `size()` 并说破"四列里只有一列需要守卫",陷阱在解题前已被拆除。PLAN(实测):HOF **0** Exchange(整题一个 Project over Scan)/ explode_outer + 条件聚合 **1** / explode + WHERE + groupBy + LEFT join 回卷 **2** + broadcast —— HOF 少有的"赢在计划形状而非风格"的场合,但优势来自**反范式布局**(数组与 key 已同置),行项目一旦独立成表就只剩 explode 路线。**超出参考的新发现**:`active` 存进 Python 变量复用 = 表达式**内联 5 份**,`CollapseProject` **主动拒绝**把非廉价表达式复制到多个使用点,所以 `withColumn` 命名版真的只算一次(Project x2 / `filter(items` x1),内联版 x5;五份拷贝的 lambda ExprId 各异(`x_7#18..#22`)因而**互不 semanticEquals**,plan 层 CSE 与运行时 subexpressionElimination 都补不全 —— 400k 行 x 12 元素实测 **0.83s vs 1.17s**(关掉 SEE 后 0.73 vs 1.39),Exchange 两边**同为 0**,是**每行 CPU** 不是 shuffle 的故事。用户 review 漏检此项,却把自己多出来的一层 `transform` 记在 Performance 栏(应为 style;实测该 transform 的代价被省下的四次 filter 完全覆盖),并误判 `F.lit("ACTIVE")` 比裸 `"ACTIVE"` 更健壮(`Column.__eq__` 自动包 lit,表达式完全相同;真正更健壮的是 AI 的 `x["status"]` 下标 vs 用户的 `x.status` 属性——后者撞上名为 `cast`/`alias` 的字段会拿到绑定方法)。用户 SQL 用 CTE 命名 `active` **优于参考答案**(ref 的 SQL 把 filter 抄了 5 遍,正文自承 CTE 更好) |
 
 > **Day 16 状态:已结。** Stage 1 + Stage 5 完成 —— log/04 里 Day 16 是全项目最大的
 > 一块,含多项 explain 实测,并推翻了 Day 7 与 log/04 各一条旧记录。
@@ -33,21 +34,29 @@
   naming, pivot -> unpivot round trip (stack / unpivot).
 
 ## Scheduled next (planned cadence, Medium / Medium-Hard)
-- Day 19 — candidate (NEXT IN QUEUE): pandas_udf as the PRIMARY topic. Day 14
-  covered the python-UDF cost model in theory but never ran an ArrowEvalPython
-  plan, so the vectorized half is still entirely unexercised — the three-tier
-  model (native ⊃ vectorizable pandas_udf ⊃ row-wise python UDF) has an untested
-  middle. Medium. Steps difficulty back down after Day 17 + Day 18 (two
-  consecutive Medium-Hard days).
-- Day 20 — candidate: higher-order array functions as the PRIMARY topic
-  (transform / filter / aggregate / exists / forall / zip_with) — surfaced by
-  AI review twice (Day 14 hand-rolled parsing, Day 18 flatten/array_distinct
-  as a load-bearing set union) but never drilled directly. Medium.
-- Later candidates: higher-order array functions as the primary topic;
-  ANSI / try_* family as a first-class topic;
+- Day 20 — candidate (NEXT IN QUEUE): **ANSI mode & the `try_*` family as a
+  first-class topic**, carried on a dirty-string-to-number ingestion problem
+  (so it doubles as the never-drilled string-processing backlog item:
+  regexp_extract / split / trim). Medium-Hard. Rationale: ANSI has been the
+  invisible premise under every day since the project started (Spark 4.x
+  defaults it ON) and has been *surfaced* twice by AI review — Day 14's
+  `element_at` explosion, and the whole `COALESCE(risky_expr, fallback)` class
+  that silently assumes a NULL ANSI never delivers — but never drilled head-on.
+  Day 19 sharpened the case by *elimination*: the HOF core
+  (filter/exists/forall/aggregate) never indexes the array, so it has **zero**
+  ANSI exposure; the topic is still entirely untested. Steps difficulty back up
+  after Day 19 (Medium).
+- Later candidates: MERGE INTO / Delta-style upsert against an existing dim
+  table (Day 17 built history from a feed, never merged into a target);
+  unpivot / melt as the primary topic (only ever touched in drills);
+  the remaining array/map HOF family (zip_with / transform_keys /
+  transform_values / map_filter) as a Day-19 sequel;
   date/time round 4 — DST-crossing tz math (a full Day-15-shaped script exists
   and was RETIRED before Stage 1: judged low interview probability, kept as an
   optional 15-minute drill) or session_window built-in as the primary topic.
+- **DROPPED (2026-08-08, user decision): `pandas_udf` / ArrowEvalPython.** Not
+  to be scheduled on Day 20 or any later day. Day 14's python-UDF half stands;
+  the vectorized half is retired unpracticed.
 
 Cadence principle: alternate the two topics, step difficulty upward, each
 problem echoes >=1 logged takeaway.
@@ -58,12 +67,19 @@ problem echoes >=1 logged takeaway.
 - UDFs: python UDF vs pandas_udf, when to avoid, cost model   <- Day 14 DONE
   for the python-UDF half (returnType, staticmethod + pickle scope,
   spark.udf.register shapes, BatchEvalPython as optimizer barrier);
-  pandas_udf / ArrowEvalPython still OPEN (Day 19 candidate)
+  pandas_udf / ArrowEvalPython **DROPPED** — user decision 2026-08-08,
+  never to be scheduled
 - Higher-order array functions as the PRIMARY topic (transform / filter /
-  aggregate / exists / forall / zip_with / transform_values)   <- surfaced
-  Day 14 via AI review, never drilled directly
+  aggregate / exists / forall)   <- **Day 19 DONE**(空集合单位元、aggregate
+  zero 定类型、`x["f"]` vs `x.f`、HOF 路线 0 Exchange vs explode 路线 1–2、
+  表达式内联不被 CSE);zip_with / transform_keys / transform_values /
+  map_filter 家族仍未实操
 - ANSI mode & the try_* family (try_element_at / try_cast / try_divide):
-  failure-vs-NULL semantics as a first-class topic   <- surfaced Day 14
+  failure-vs-NULL semantics as a first-class topic   <- surfaced Day 14;
+  Day 19 confirmed the HOF core has ZERO ANSI exposure, so still 100% open
+  <- **Day 20 candidate (NEXT)**
+- String processing: regexp_extract, split, sentence-level parsing
+  <- to be folded into the Day 20 ANSI problem as its carrier data
 - Unpivot / melt as the primary topic (only touched in drills)
 - Date/time deep dive: timezones, timestamps, truncation, ranges,
   calendar join against a date dimension   <- Day 11 DONE (UTC->local
@@ -82,7 +98,6 @@ problem echoes >=1 logged takeaway.
 - Skew handling: salting, AQE skew join   <- Day 18 DONE (salted join +
   two-phase agg + decomposability; AQE skew join 只读到配置与两道触发门槛,
   14 行数据上无法触发 OptimizeSkewedJoin —— 真实倾斜数据上的 AQE 行为仍 OPEN)
-- String processing: regexp_extract, split, sentence-level parsing
 - Semi/anti joins: left_semi, left_anti as filter idioms   <- DONE (Day 9)
 
 ## Difficulty cadence
