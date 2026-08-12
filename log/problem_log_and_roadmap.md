@@ -22,6 +22,7 @@
 | 17 | Incremental patterns: SCD2 history build from a change feed (run-based versioning: lag -> boundary flag -> running SUM -> half-open interval closing) | Medium-Hard | Build the SCD2 history table from an append-only product attribute feed: one row per (product, version) with effective_from / effective_to / is_current, tracked attrs = category + price | no-op replay is the trap: a version is a *run* of feed rows, not a feed row. `lead(changed_at) OVER (partition by product_id order by changed_at)` IS the correct interval-closing idiom — it is only applied to the wrong row set, so one-row-per-version is right on every product whose consecutive rows genuinely differ (8 of 9 expected rows, 3 of 4 products correct); P1's 01-05 replay is the only exposing row, and it fails BOTH ways at once (spurious version AND the surviving interval truncated 01-01->01-05 instead of ->01-10). Adjacent, not the trap: P4 `40 -> 45 -> 40` — boundary detection must be POSITIONAL (lag vs current), never value-set-based; `dropDuplicates([id,category,price])` / DISTINCT collapses the two non-adjacent 40.0 runs and loses the third interval. Half-open `[from,to)` needs NO date arithmetic (`effective_to = lead(effective_from)`, no date_sub -1); `is_current = effective_to IS NULL` is DERIVED, a second `row_number() desc = 1` window re-sorts to learn the same fact. Window functions are ILLEGAL in WHERE/HAVING in both APIs (`AnalysisException: It is not allowed to use window functions inside WHERE clause`) — materialize via withColumn / a CTE first. AI-review: AI's change predicate `prev_category.isNull() \| (prev_cat != cat) \| (prev_price != price)` guards only ONE of the two attributes — on a NULL price the whole OR chain returns NULL, cast("int") -> NULL, running SUM skips it and FREEZES, collapsing every subsequent row into one version (measured: 4 dirty rows -> 1 version vs the correct 3). Test data can never expose it (spec guarantees non-NULL attrs). User's `F.struct(cat,price) != F.struct(prev_cat,prev_price)` was immune for a reason the user hadn't identified: struct comparison is FIELD-WISE NULL-SAFE, so the predicate never yields NULL and the `.otherwise(0)` was dead code (measured: user_flag = 1 on every product's first row, identical to AI's and the ref's). AI's explicit `ROWS` vs user/ref default `RANGE` on the running SUM: indistinguishable here only because the spec forbids duplicate changed_at per product. PLAN (measured): all 4 solutions = 1 Exchange (groupBy after a window adds none — window partitionBy ⊆ grouping keys, re-confirms Day 16); user 2 Sorts vs AI 3, because user's second window `orderBy('boundary')` reuses the aggregate's output ordering while AI's `orderBy('effective_from')` does not — an accidental win, and the ONLY plan difference. `min`/`max` on a STRING column forces SortAggregate (non-fixed-width agg buffer, extends the Day 16 `min(struct(...))` finding); moving the run-constant attrs into the grouping key (ref's route) restores HashAggregate — isolated A/B, only the agg list changed |
 | 18 | Skew handling: salted join + two-phase aggregation (pmod salt -> dimension replication via explode(sequence) -> partial/final recombination) | Medium-Hard | Per-customer summary over a skewed fact table, forced through a salted join + two-phase agg: total_amount (SUM) + n_products (DISTINCT count) | DISTINCT 计数在盐桶上**不可分解**是全题靶心:partial `COUNT(DISTINCT product)` per (cust,salt) -> final `SUM` 对每个跨桶的 product 重复计数(实测 C_HOT n_products=**8** vs 正确 **4**),而同一个 agg 里的 total_amount 因为 SUM 可分解**永远正确**——输出是**半对的一行**:钱对、基数错。四行里只有热点键暴露:C1 的 10/13/16 全满足 `id%3==1` 整个落单桶,且它是唯一有重复 product 的冷客户(专骗"重复产品处理对吗"这类检查);C2 跨两桶但两个产品互不跨桶;C3 单行。两条正解:`collect_set` -> `flatten` -> `array_distinct` -> `size`(集合并可分解,`array_distinct` 是**承重**不是防御,因为 collect_set 只在桶内去重);或把 product 放进 partial 分组键把 distinct 推迟到第二阶段。用户解法两个 bug **互相抵消**:盐取自 join key(`pmod(hash(customer_id),3)`)-> 同一客户同盐、热点 8 行全落一个桶、维度白复制 3x,且第二阶段聚合**完全缺失**(SQL 侧 `GROUP BY` 里根本没有 salt,是单阶段)——把盐换成 `pmod(order_id,3)` 立刻从 4 行变 **7 行**。`approx_count_distinct` 在基数 <=4 时与精确值逐行相同,**任何测试数据都分辨不出**(默认 rsd=0.05)。AI(= 参考 Route B)全对,未踩陷阱。PLAN(实测,broadcast off):不加盐基线 **2** Exchange / 加盐+collect_set **3** / 加盐+product 进 partial 键 **4** —— **加盐路线是最贵的**;"去盐税"那个 Exchange 由 `salt ∈ 分区键 ∉ 最终分组键` 结构性导致(Exchange 子集规则第三次确认),`COUNT(DISTINCT)` 的重写还要再按 `(keys, product)` 多插一个。AQE skewJoin 需**同时**满足 >256MB **且** >5x 中位数,14 行两条都不达标,只观察到 `AQEShuffleRead coalesced`,**没有** `OptimizeSkewedJoin` |
 | 19 | 高阶数组函数(transform / filter / exists / forall / aggregate / size,数组内原地计算) | Medium | 订单行项目以 array<struct> 反范式存储,每单出一行汇总:n_active / active_total / has_bulk / all_in_stock,禁止 explode + groupBy 回卷 | `forall([])` 返回 **true**(AND 单位元)是全题靶心:`filter(items, status='ACTIVE')` 清空数组后,零 ACTIVE 行的订单被判成"全部有货"。规格里"AT LEAST ONE ACTIVE ... AND ..."的第一个子句 `size(active) > 0` 是**承重**不是防御。同组四个度量只有它错:`size([])=0` ✓、`aggregate([],0.0D,…)=0.0` ✓、`exists([])=false`(OR 单位元)✓、`forall([])=true` ✗ —— 失败是 5x5 输出网格里的**单个格子**(O4.all_in_stock),同一行另外四列全对。唯一暴露行 O4 两行全 CANCELLED **且**两行 in_stock 都为 true(堵死"忘了 filter 也能蒙对"的后门);D2 qty=15 顺带校验 has_bulk 真的过滤了,O2.B2(CANCELLED, 20@100.0)让漏过滤在 active_total 上炸成 2048.0 而非 48.0。`aggregate` 的 zero 钉死累加器类型且**无隐式加宽**:DSL `F.lit(0)`、SQL `0`、SQL 裸 `0.0`(**DECIMAL(1,1)**,不是 double)三者全在分析期 `DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE` 死掉——响的,不是静默的。AI(= 参考 Route A)全对未踩陷阱;用户 Stage-1 也对,但**本日 trap 维度无有效信号**:用户在 Stage 1 中途直接问了"空数组怎么判",教练给了 `size()` 并说破"四列里只有一列需要守卫",陷阱在解题前已被拆除。PLAN(实测):HOF **0** Exchange(整题一个 Project over Scan)/ explode_outer + 条件聚合 **1** / explode + WHERE + groupBy + LEFT join 回卷 **2** + broadcast —— HOF 少有的"赢在计划形状而非风格"的场合,但优势来自**反范式布局**(数组与 key 已同置),行项目一旦独立成表就只剩 explode 路线。**超出参考的新发现**:`active` 存进 Python 变量复用 = 表达式**内联 5 份**,`CollapseProject` **主动拒绝**把非廉价表达式复制到多个使用点,所以 `withColumn` 命名版真的只算一次(Project x2 / `filter(items` x1),内联版 x5;五份拷贝的 lambda ExprId 各异(`x_7#18..#22`)因而**互不 semanticEquals**,plan 层 CSE 与运行时 subexpressionElimination 都补不全 —— 400k 行 x 12 元素实测 **0.83s vs 1.17s**(关掉 SEE 后 0.73 vs 1.39),Exchange 两边**同为 0**,是**每行 CPU** 不是 shuffle 的故事。用户 review 漏检此项,却把自己多出来的一层 `transform` 记在 Performance 栏(应为 style;实测该 transform 的代价被省下的四次 filter 完全覆盖),并误判 `F.lit("ACTIVE")` 比裸 `"ACTIVE"` 更健壮(`Column.__eq__` 自动包 lit,表达式完全相同;真正更健壮的是 AI 的 `x["status"]` 下标 vs 用户的 `x.status` 属性——后者撞上名为 `cast`/`alias` 的字段会拿到绑定方法)。用户 SQL 用 CTE 命名 `active` **优于参考答案**(ref 的 SQL 把 filter 抄了 5 遍,正文自承 CTE 更好) |
+| 20 | ANSI 模式与 try_* 家族(try_cast / try_to_number / try_divide / try_sum),脏字符串入库 | Medium-Hard | 三个上游把全 STRING 的销售记录落到一张表,按 source 出入库报表:n_records / n_bad_amount / net_amount / total_units / avg_unit_price | `try_cast(units_raw AS INT)` 对 `'12.0'` 返回 **NULL** 是全题靶心:string→INT 要求**整数字面量**,与 numeric→INT 的"截断"是**两条不同的解析路径**(`cast(12.7 AS INT)`=12 实测)。唯一暴露行 R05,而它的 `amount_raw` 是全表最干净的串(`'420.00'`,无 $ 无逗号无空白无符号)——注意力被刻意引开。失败形状是 3x6 网格里**同一行的两格**(total_units 4 vs 16、avg 379.88 vs 94.97),该行的 n_records / n_bad_amount / net_amount **全对**(两个字段独立解析),且错误值 4 是个合理的小正整数,输出形状不含任何"解析失败"的信号。正解 `try_cast('double').try_cast('int')`,**第二跳也必须是 try_**(`cast(3.0E9 AS INT)` 在 ANSI 下抛 CAST_OVERFLOW)。邻近但非陷阱:贪婪的 `regexp_replace(amount_raw,'[^0-9.]','')` 会把**负号**一起剥掉,退款 -120 变 +120(SRC_A 1980.5→2220.5)——黑名单去噪 `[$,]`,永不白名单信号。**用户走了参考答案没有的第三条路**:双掩码 `try_to_number` coalesce(`S$999,999,999.99` / `S999,999,999.99`),绕开了 ref"单一 format 覆盖不了三种形态"的论据;实测它在 `'NaN'`/`'Infinity'` 上**比 ref Route A 更安全**(ref 的裸 `try_cast('double')` 把两者解析成 nan/inf,是 ref 自承的真洞),但在 `'$1234.56'`(带 $ 不带逗号)与超 10 亿的金额上**返回 NULL**——掩码里 `,` 是"位数够了就必需",且宽度即业务上限。可选元素需 2^k 个掩码。AI(≈ ref Route B)**未踩陷阱**:正则闸门 + `regexp_extract` 抠整数位,且在 `'12.5'` 上**比用户和 ref Route A 都更贴 spec**(两者静默截断成 12,AI 判 NULL;ref 自己承认 Route B 对)。AI 唯一实质问题 `COALESCE(sum(amt), 0.0)`:本数据每个 source 至少一个可解析金额,**不可达**(ref 定性为 dead code),但在"整组全不可解析"的输入上把 NULL 变成 0.0——spec 从未这么说。**用户 REVIEW_NOTES 六条里四条是裸 LGTM,唯一漏报恰好落在专为它设的 Robustness 栏。** trap 维度**本日无有效信号**(用户首次接触 try_*,Stage 1 中途由教练说破机制)——但 coalesce 漏报与裸 LGTM 是**未被污染的信号**,与 try_* 知识无关。PLAN(实测):user-DSL / user-SQL / AI-DSL / AI-SQL **四份节点级同构**,均 Exchange **1** / HashAggregate **2**(partial+final)/ Sort **0**,四个聚合全定宽故停在 HashAggregate;**两条路线之间没有性能故事**(ref 明写 "none should be invented")。附:`try_divide` 在执行计划里渲染成**裸 `/`**(EvalMode.TRY 不打印),ANSI 安全性**只能审源码,不能审 explain** |
 
 > **Day 16 状态:已结。** Stage 1 + Stage 5 完成 —— log/04 里 Day 16 是全项目最大的
 > 一块,含多项 explain 实测,并推翻了 Day 7 与 log/04 各一条旧记录。
@@ -34,21 +35,25 @@
   naming, pivot -> unpivot round trip (stack / unpivot).
 
 ## Scheduled next (planned cadence, Medium / Medium-Hard)
-- Day 20 — candidate (NEXT IN QUEUE): **ANSI mode & the `try_*` family as a
-  first-class topic**, carried on a dirty-string-to-number ingestion problem
-  (so it doubles as the never-drilled string-processing backlog item:
-  regexp_extract / split / trim). Medium-Hard. Rationale: ANSI has been the
-  invisible premise under every day since the project started (Spark 4.x
-  defaults it ON) and has been *surfaced* twice by AI review — Day 14's
-  `element_at` explosion, and the whole `COALESCE(risky_expr, fallback)` class
-  that silently assumes a NULL ANSI never delivers — but never drilled head-on.
-  Day 19 sharpened the case by *elimination*: the HOF core
-  (filter/exists/forall/aggregate) never indexes the array, so it has **zero**
-  ANSI exposure; the topic is still entirely untested. Steps difficulty back up
-  after Day 19 (Medium).
+- **先行 drill(NEXT IN QUEUE,先于 Day 21)**:unpivot / melt mini-drills
+  (`stack` / `DataFrame.unpivot`,约 15 分钟,进 Supplemental drills)。
+  **无 trap、无 review 闭环**,只跑通签名与基本语义:DSL 的
+  `df.unpivot(ids, values, variableColumnName, valueColumnName)` vs SQL 的
+  `stack(n, 'k1', v1, ...)` 与 `UNPIVOT` 子句、NULL 值列的默认丢弃行为、
+  多度量组同时 unpivot、`pivot -> unpivot` 往返。
+- Day 21 — candidate: **unpivot / melt 作为一等主题**(宽表转长表:列名解析成
+  维度、NULL 值列的丢弃语义、多度量组)。Medium。理由:backlog 里唯一
+  "只在补充练习里碰过、从未作为当日主题"的条目;Day 3 做过 pivot 正向,
+  反向从未单独 drill。难度从 Day 20 (M-H) 回落到 M,符合节奏。
+  **前置条件:上面那个 drill 必须先做完**——unpivot 的 API 面极小(两个调用),
+  一个 drill 就能完全关闭"不知道怎么调"这一层,剩下的语义空间足够撑起一个
+  靠读能抓到的 trap。这正是 Day 20 缺的结构。
+- 备选(primitives 全是已知的,不需要 drill):session_window 内置函数 vs
+  Day 13 手搓的 lag+running-sum 会话化——语义 Day 13 已吃透,内置版的边界约定
+  不同(`<` 而非 `<=`、`end = last + gap`,已记在 Day 13 行),trap 天然落在
+  "两种约定的差异"上,纯语义。缺点:有与 Day 13 重复的风险。
 - Later candidates: MERGE INTO / Delta-style upsert against an existing dim
   table (Day 17 built history from a feed, never merged into a target);
-  unpivot / melt as the primary topic (only ever touched in drills);
   the remaining array/map HOF family (zip_with / transform_keys /
   transform_values / map_filter) as a Day-19 sequel;
   date/time round 4 — DST-crossing tz math (a full Day-15-shaped script exists
@@ -60,6 +65,13 @@
 
 Cadence principle: alternate the two topics, step difficulty upward, each
 problem echoes >=1 logged takeaway.
+**任何当日主题所需的核心 API,若从未实操过,先出一个 supplemental drill
+(无 trap、无 review 闭环、只跑通签名与基本语义),drill 之后再进正式日。**
+否则 Stage 1 会退化成 API 教学,trap 必须被讲破才能完成 Stage 1,
+trap 维度不产生有效信号(Day 20 的实际结果;Day 19 是部分版本——
+`transform` 在 Day 14 记过,属"已知 API + 未知边界",陷阱仍在 Stage 1 丢失)。
+判据不是"这个主题做过没有"(backlog 里的条目按定义全都没做过),而是
+**Stage 1 是否需要现学一个函数是干什么的**。
 
 ## Backlog (rotate, alternate difficulty, avoid recent repeats)
 - Complex aggregation: multiple grains in one pass, grouping sets /
@@ -77,9 +89,15 @@ problem echoes >=1 logged takeaway.
 - ANSI mode & the try_* family (try_element_at / try_cast / try_divide):
   failure-vs-NULL semantics as a first-class topic   <- surfaced Day 14;
   Day 19 confirmed the HOF core has ZERO ANSI exposure, so still 100% open
-  <- **Day 20 candidate (NEXT)**
+  <- **Day 20 DONE**(string→INT 与 numeric→INT 是两个 parser;try_to_number
+  的定长掩码语言与 2^k 可选元素问题;try_cast 把响的失败变成静默的失败;
+  DSL 里 format 参数 ColumnOrName vs str 两套不统一的约定;EvalMode.TRY
+  在 explain 里不可见)。`try_element_at` / `try_add` / `try_avg` /
+  `try_parse_url` 等家族其余成员仅做过对照实测,未在题目里实操
 - String processing: regexp_extract, split, sentence-level parsing
-  <- to be folded into the Day 20 ANSI problem as its carrier data
+  <- **部分关闭(Day 20)**:`regexp_replace` + 字符类去噪、SQL 字符串里的
+  两层反斜杠转义(`'\$'` 静默失效 / `'\\$'` 才对 / `[$,]` 两层都绕开)已实操;
+  `regexp_extract` 只在 AI 解法里出现过,`split` / 句级解析仍 OPEN
 - Unpivot / melt as the primary topic (only touched in drills)
 - Date/time deep dive: timezones, timestamps, truncation, ranges,
   calendar join against a date dimension   <- Day 11 DONE (UTC->local

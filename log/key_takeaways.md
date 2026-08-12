@@ -686,6 +686,72 @@
   契约**:SQL 不保证 AND 的求值顺序。Catalyst 通常会短路,但**永远不要**把安全
   建立在它上面。用 try_element_at,或用一个根本不可能越界的内置函数。
 
+### 字符串 cast 的目标类型是 parse 的一部分 (Day 20 实测)
+- `try_cast(s AS INT)` 与 `try_cast(try_cast(s AS DOUBLE) AS INT)` 是**两个不同
+  的 parser**,不是"同一个 parser 后面挂了一次转换"。string→整数类型只接受
+  **整数字面量**(可选符号 + 纯数字);numeric→整数类型才是截断 + 范围检查。
+- 实测同一批串在不同目标类型上的结果(ANSI=true,`try_cast`):
+  `'12.0'` → int **NULL** / decimal 12.00 / double 12.0;`'12.5'`、`'1e3'`、
+  `'.5'`、`'12.'` 同样只有 int/bigint 判 NULL。`' 7 '` → 7(cast **会** trim)、
+  `'0012'` → 12、`'+8'` → 8。
+- **这是 3.x → 4.x 的静默行为变更**:`ansi=false` 时 `cast('12.0' AS INT)` 返回
+  **12**(走宽松的"先解析再截断"路径),`ansi=true` 抛 CAST_INVALID_INPUT,包上
+  `try_` 则是 NULL。同一段代码在 3.x 跑对、搬到 4.x **静默丢数**,单元测试不报错。
+  注意非 ANSI 的宽松也不是无边界的(`cast('1e3' AS INT)` 在两种模式下**都是**
+  NULL),所以"把 ANSI 关掉"从来不是修法。
+- 第二跳**也必须是 try_**:`cast(3.0E9 AS INT)` 在 ANSI 下抛 CAST_OVERFLOW。
+  正则闸门**不会**让一个 cast 变安全——`'3000000000'` 能通过 `^\d+$`。
+- 数值 → int 是**截断**且**向零取整**(`-12.9` → `-12`,不是 -13),不是四舍五入;
+  要四舍五入得显式 `round()`。这是两步路线第二跳必须自己决定的语义。
+- 判"这个小数是不是整数值"的写法:`d == F.floor(d)`(先落到 decimal/double)。
+  不做这一步就等于接受"截断"语义;spec 说 whole count 时,`'12.5'` → 12 是
+  **偏离规格**(Day 20 里用户与 ref Route A 都踩了,AI 没踩)。
+
+### try_cast 把响的失败变成静默的失败 (Day 20)
+(扩展 "API 风格约定" 里 "try_cast 只用于确实脏的数据" 一条)
+- 裸 `cast` 在 ANSI 下抛错并**报出具体的坏值**;包上 `try_` 换来的健壮性,代价是
+  **销毁了这个诊断信息**。`try_*` 是一个**数据质量决策**,不是健壮性改进。
+- 由此:`try_*` 产出的 NULL 与源端真的发来 NULL **是同一个 NULL**,下游再也分不开
+  "值缺失"和"值是垃圾"。要区分,必须在**做解析的那一个 projection 里**同时捕获,
+  信息一旦流走就没了。
+- 反向的实用面(Day 20 靶心之外最有用的一条):**解析即校验**。`try_*` 返回 NULL
+  这件事**定义上就是**"这个串不是该类型的合法字面量",所以 `parsed IS NULL`
+  可以**同时**充当两个用途——`try_sum(parsed)` 天然跳过它(= 不计入),
+  `count_if(parsed IS NULL)` 数它(= 计坏行)。两者读同一列,**不可能不一致**。
+- 不要另写校验器。实测手写 `^-?[0-9]+(\.[0-9]+)?$` 与 `try_cast` 在 20 个样本里
+  **分歧 5 处**(`1e3` / `+8` / `.5` / `12.` / `' 7 '` 全是 cast 接受、正则拒绝),
+  且 `rlike` 对 NULL 输入返回 **NULL 而非 false**——`count_if(NOT valid)` 会让
+  那一行既不算好也不算坏,直接从统计里蒸发。
+- 但 `try_cast` 接受的东西也比直觉多:`'NaN'` → nan、`'Infinity'` → inf、
+  `'1.2e3'` → 1200.0(均实测)。**非 NULL 不等于源端发来了一个 sane 的数**,
+  而 nan 会毒化它经过的每一个 SUM。
+
+### to_number / try_to_number 的 format 是定长掩码语言 (Day 20 实测)
+- 心智模型:掩码**不是正则、不做清洗**,而是一条按位对齐的模板,套不上就整体判失败。
+- 数字位:`9` 该位可空缺(位数少于掩码可以);`0` 该位必须有字符。**两者都不容忍
+  位数超出**(`'1234'` 配 `'999'` 是 NULL,不是截断)。
+- 字面元素的行为**不一致**,这是最反直觉处:
+  * `$` 是**硬性双向绑定**——掩码有它输入必须有,掩码没有输入就不许有。
+    **没有"可选"档位**。
+  * `,` 是**条件必需**——数字没到千位时可以省(`'12.34'` 配 `'9,999.99'` ✓),
+    到了千位却不写就判失败(`'1234.56'` 配 `'9,999.99'` ✗)。
+  * 空白反而最宽松:两侧空白自动吃掉,**连中间空格也吃**(`'1 2.34'` → 12.34,
+    一个明显损坏的值被静默接受)。
+- 符号必须显式声明,且三种不等价(实测):`S` 收 `-` 与 `+`;`MI` 只收 `-`;
+  `PR` 收会计式 `<1234>`。位置有意义(前置 `S` 只匹配前置符号)。默认掩码
+  **不接受任何符号**,负数必然 NULL。
+- 掩码同时决定输出的 `decimal(p,s)` **和业务上限**:`'$9,999.99'` → decimal(6,2),
+  五位数金额判 NULL;小数位多了也是直接拒绝(`'1.999'` 配 `'9.99'` → NULL),
+  **不四舍五入**。这是一个隐性硬编码假设,review 时属于 Robustness。
+- **k 个可选元素需要 2^k 个掩码**。Day 20 实测:8 种单掩码在 7 个真实形态上
+  最高只覆盖 3/7;`$`有无 × 逗号有无 = 4 掩码 coalesce 才全覆盖。
+  多掩码 `coalesce(try_to_number(x, m1), try_to_number(x, m2), ...)` 是对付
+  可选性的标准手法,但组合会爆炸。
+- 与"正则去噪 + try_cast"的取舍**不是性能**(Day 20 实测四份计划节点级同构),
+  **是谁拥有"合法"的定义**:掩码校验强、拒绝烂形状、但表达不了可选性;
+  正则路线支持可选性、但形状不再被校验。两者**没有谁更严格**——
+  `'1 2.34'` 只有正则路线挡住,`'1,00,0.5'`(烂分组)两条都放行。
+
 ## 物理计划 / explain()
 - **自下而上**读;关键节点:Scan(数据源 + 统计信息质量)、Exchange
   (**每个 = 一次 shuffle**,成本主因)、join 节点(策略 + BuildLeft/Right 侧)、
@@ -743,6 +809,13 @@
     shuffle 的故事,又一次印证"Exchange 数相同时要说出真正的机制"。
     (注:命名版还**多**背了一层 `transform`,仍然赢——那层 transform 的代价被
     省下的四次 `filter` 完全覆盖。)
+- **eval mode 在物理计划里不可见**(Day 20 实测):`try_divide(a,b)` 渲染成
+  **裸 `/`**——`round((net_amount#8 / cast(total_units#9 as double)), 2)`——
+  却在除零时返回 NULL 而不抛异常。`try_divide` 下降成一个携带 `EvalMode.TRY`
+  的 `Divide`,而计划打印器**不显示**这个字段。
+  **推论:ANSI 安全性的 review 只能在源码上做,永远不能在 explain() 输出上做。**
+  这与"性能结论必须数 Exchange"是互补的两条规矩——**同一份 explain,
+  对性能是权威,对失败语义是盲的。**
 
 ## API 风格约定
 - 纯列引用(select/groupBy/on)-> 用普通字符串;当列参与表达式(比较、算术、
@@ -755,6 +828,37 @@
   测试两种写法都抓不到。
 - LATERAL VIEW OUTER EXPLODE(Hive 风格,兼容性最好)vs 现代的
   LATERAL explode_outer(...)——Spark 3.x 里都可以。
+- **`F.try_cast` 不存在**(实测 `hasattr(F,'try_cast') == False`,pyspark 4.1.1)。
+  它是 **`Column.try_cast(dataType)`** 方法;而 `F.try_divide` / `F.try_to_number`
+  / `F.try_element_at` / `F.try_sum` **是** functions。SQL 侧则统一:
+  `try_xxx(...)` 全是函数,外加 **`try_cast(x AS T)` 是语法而非函数**——写成
+  `try_cast(x, 'INT')` 报的是 `UNRESOLVED_ROUTINE`("找不到这个函数"),因为它
+  根本不是函数。这是 Day 12 `F.grouping_sets` 不存在 / `DataFrame.groupingSets`
+  存在的**第二次独立确认**:能力"存在"不等于"在你以为的那个命名空间里"。
+- **DSL 里 format 参数有两套互斥的约定,且同族函数不一致**(Day 20 实测签名 + 行为):
+  * `format: 'ColumnOrName'` → **必须** `F.lit(...)`:`to_number` / `try_to_number`
+    / `to_char` / `to_binary` / `try_to_binary` / **`try_to_timestamp`**
+  * `format: Optional[str]` → **必须**裸 str,传 `F.lit` 报 `NOT_ITERABLE`:
+    **`to_timestamp`** / `to_date` / `try_to_date` / `date_format`
+  * 注意 `to_timestamp` 与 `try_to_timestamp` **约定相反**——给一段跑通的
+    `to_timestamp(x,'fmt')` 加上 `try_` 前缀就炸。`try_` 前缀**不能**预测约定。
+  * 传裸 str 给 ColumnOrName 那批,报错不是 TypeError 而是
+    **`UNRESOLVED_COLUMN`**——它在满世界找一个叫 `'$999,999.99'` 的列。
+  * `ColumnOrName` 这个标注是**虚的**:format 必须 foldable,真传一个列会报
+    `DATATYPE_MISMATCH.NON_FOLDABLE_INPUT`,所以合法写法只有 `F.lit`。
+  * 写之前 `inspect.signature(F.xxx)` 看一眼,两秒钟。**SQL 侧不存在这个问题。**
+- **SQL 字符串里的正则有两层转义,写错是静默失效**(Day 20 实测):
+  SQL 层 `'\$'` 和裸 `'$'` **都什么也不做**($ 是行尾锚点,匹配末尾空串),
+  `'\\$'` 才对。再叠上 Python:普通三引号里写 `'\\$'` → SQL 收到 `'\$'` → 失效;
+  要 `r"""..."""` 或写四个反斜杠。**用字符类 `'[$,]'` 可以两层都绕开**,
+  零反斜杠且一次剥两种符号。
+- **SQL 的 lateral column alias 能力比标准 SQL 宽**(Day 20 实测,Spark 3.4+):
+  同层 SELECT 里可以引用前面的别名,**包括聚合别名**
+  (`SELECT source, sum(x) AS a, a/2 AS b ... GROUP BY source` ✓),HAVING /
+  ORDER BY 里也可以。**但逐行别名不能和聚合混在同一层**
+  (`SELECT source, try_cast(u AS INT) AS p, sum(p) ... GROUP BY source`
+  → `MISSING_AGGREGATION`)——`withColumn` 在 SQL 里的对应物是 **CTE/子查询**,
+  不是别名。依赖 LCA 的代码**不可移植**(Postgres 不允许),属于 portability。
 
 ## NULL 语义总表 (Day 16)
 - **`=` 在 NULL 上不自反**:`NULL = NULL` 是 UNKNOWN 而不是 TRUE。所以任何
@@ -1228,3 +1332,23 @@
   (多一层 `transform`,实为 style),没看**对方那侧**重复的东西(5x `filter`,
   实为 perf),于是 Performance 栏记的是自己的心事,不是对方的问题。
   **读对方代码时,先独立数一遍重复表达式,再去比对两版的差异。**
+- **`COALESCE` 包住聚合函数时,先问"什么样的分组会让这个聚合返回 NULL"**(Day 20):
+  看到 `COALESCE(sum(x), 0)` / `COALESCE(count(...), 0)` 这类**外层包聚合**的写法,
+  如果答案是"测试数据里不存在这种分组",那它既不是防御、也不会被测出来——
+  它是一个**未声明的语义选择**,应当按 **Robustness** 报出(spec 没说过全坏组该报 0),
+  而不是按 style 放过。Day 20 实测:`COALESCE(sum(amt), 0.0)` 在本数据上不可达,
+  在"某 source 全部金额不可解析"的输入上把 NULL 变成 0.0。
+  **注意与 Day 14 那条区分,这是两种不同的死代码**:
+  `COALESCE(risky_expr, fallback)` 在 ANSI 下**不可达**(先抛异常);
+  `COALESCE(agg, literal)` **可达**,只是本数据不触发,一旦触发就**改语义**。
+  前者要改成 try_*,后者要问 spec。
+  (附:`count` 家族空组返回 **0**,`sum` 空组返回 **NULL**——这个差别正是
+  `COALESCE(agg, literal)` 会不会被写出来的根源。)
+- **一段代码里出现两个"合法性"定义时,先找出至少一个分歧样本再下 verdict**(Day 20):
+  看到手写正则 / 白名单 / `IN (...)` 与 `try_cast` / `try_to_number` 出现在**同一条
+  表达式链**里,问"**最终判据是谁?**"。两个独立的合法性定义必然在某组输入上分歧,
+  常备探针:科学计数法 `1e3`、正负号 `+8`、`.5` / `12.`、前导/尾随空格、
+  `NaN` / `Infinity`、超宽值、前导零。**举不出分歧样本 = 还没读懂那个正则**,
+  此时正确的动作是把题面 EXAMPLE 框里的输入串逐个代入,而不是在 REVIEW_NOTES 里
+  写 "not sure"。同族:Day 15 `=0` vs `>0`、Day 17 的 NULL 守卫、Day 18 的
+  `approx_count_distinct`——"两边全绿,却在测试数据缺失的输入上分歧"。
