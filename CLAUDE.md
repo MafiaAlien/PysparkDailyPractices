@@ -37,6 +37,9 @@ CLAUDE.md                     this file
 .claude/commands/             /newday /genprompt /review /digest
 templates/template_v2.py      day-file skeleton (Parts 1–3, 5-review)
 templates/template_ref.md     reference skeleton (Part 4, Part 5-concept)
+templates/template_etl.py     ETL scenario day skeleton (Day 22+)
+templates/template_etl_ref.md ETL scenario reference skeleton (Day 22+)
+docs/superpowers/specs/       design specs (not part of the daily workflow)
 days/dayNN_<slug>.py          the working file — user edits Part 1 and Part 3
 refs/dayNN_<slug>_ref.md      reference answers + trap explanation (SEALED —
                               day 17 onward; opens only in Stage 5)
@@ -50,7 +53,7 @@ log/key_takeaways.md
 
 | Stage | Who | Command |
 |-------|-----|---------|
-| 1 SOLVE    | user implements `solve_dsl` + `solve_sql`, runs tests | `/newday` produced the file |
+| 1 SOLVE    | user implements the two Part 1 functions, runs tests | `/newday` produced the file |
 | 2 GENERATE | user gets an independent AI solution in a **separate incognito conversation** | `/genprompt` |
 | 3 REVIEW   | user pastes AI code into Part 3, reviews **by reading only**, commits a VERDICT before running | — |
 | 4 VERIFY   | user uncomments the Stage-4 lines and runs | — |
@@ -63,11 +66,69 @@ context at that moment and must not survive into Stage 1.
 
 ---
 
+## Problem mode — Day 22 onward
+
+Day 1–21 introduced one new operator or semantic edge per day. That is
+**retired**. From Day 22, each day is **one complete production ETL
+pipeline**, composed of techniques the user has already practiced. The point
+is fluency and production instinct on a long job, not learning a new
+function.
+
+Two failure modes drove the switch, both recorded in the roadmap: the
+remaining backlog had drifted toward low-production-value APIs, and Days 19
+and 20 both lost their whole trap dimension because Stage 1 degenerated into
+API teaching.
+
+**Shape of a day:** 3–4 input tables, 1 output table, 3–6 named pipeline
+stages, one hidden trap, and 2–3 production constraints written openly in the
+problem statement as `P1/P2/P3`.
+
+**Technique whitelist** (these recur; none is ever "the topic" again):
+window `row_number` dedup / Top-N / `lag` / `lead` / running sum, replay
+counting, `dropDuplicates` is not a contract; ROWS vs
+RANGE frames; inner / left / anti / semi joins, `broadcast`, nullable keys
+(`<=>` vs sentinel), orphan keys; conditional aggregation, `GROUPING SETS`,
+`COUNT(*)` vs `COUNT(col)`; UTC→local bucketing, date-dimension spine
+gap-fill, event-date attribution, interval closing; gap-threshold
+sessionization, run-based version splitting; SCD2 half-open intervals,
+upsert; `explode_outer`, `collect_set`, dot-path access, array&lt;struct&gt;
+`filter` / `size` / `aggregate`; NULL-ignoring aggregates, `NOT IN`
+three-valued logic, window NULL ordering; pivot / unpivot; salting plus
+two-phase aggregation and the AQE skew thresholds; `explain()` Exchange
+counting, broadcast detection,
+the partition-key subset rule; `regexp_extract` / `regexp_replace` / `split`.
+
+**Blacklist — never schedule:** the `try_*` family (`try_cast` /
+`try_to_number` / `try_divide` / `try_sum` / `try_element_at` / `try_add` /
+`try_avg` / `try_parse_url`), `pandas_udf` / ArrowEvalPython, the
+`session_window` built-in, `zip_with` / `transform_keys` /
+`transform_values` / `map_filter`. Python UDFs are a **review target** only:
+an AI solution may use one and the user should catch it, but never require
+the user to write one.
+
+**ANSI mode is not blacklisted.** Only the `try_*` API is. `cast`, division,
+and array indexing still throw under ANSI, so the REVIEW_NOTES ANSI row stays
+and still governs every `COALESCE(risky_expr, fallback)` that shows up in
+review.
+
+**Not simulated:** no real parquet partition directories. This runs on one
+laptop, not a cluster; idempotency and overwrite semantics are expressed
+through the output contract and assertions, and the harness stays in-memory
+DataFrames.
+
+---
+
 ## Q&A style
 
 - Direct and structured. No preamble, no praise.
 - Sort every finding by severity:
-  **runtime break > wrong results on dirty data > performance > portability > style**
+  **runtime break > wrong results on dirty data > production robustness >
+  performance > portability > style**
+- `production robustness` = re-run not idempotent, late data dropped or
+  misattributed, one metric computed two ways, missing quality assertions.
+  It sits below wrong-results because it is correct on the first run and
+  only breaks on the second — later to surface, still a correctness class,
+  never demotable to performance.
 - An unused intermediate column is **style**, not performance, unless it adds
   an Exchange. Verify before classifying — misfiling this distorts the whole
   severity ordering.
