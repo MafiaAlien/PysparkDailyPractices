@@ -56,10 +56,16 @@ Generate the next day's practice problem. Do **not** solve it.
      (NOT in `days/` — the sealed answers live in the sibling `refs/` dir)
    Rename every placeholder identifier: `table_a` / `table_b` become the real
    input table names, and `build_output_table_dsl` / `build_output_table_sql`
-   become `build_<output_table>_dsl` / `build_<output_table>_sql`. Update the
-   two `createOrReplaceTempView` calls, the two `check(...)` calls, and the
-   two commented Stage-4 lines to match. Leave the `# >>> PASTE BEGIN` /
-   `# >>> PASTE END` markers empty.
+   become `build_<output_table>_dsl` / `build_<output_table>_sql`. The
+   template's two parameters are a **starting point, not a limit** — add or
+   delete parameters so the function signatures carry exactly the input
+   tables this day declares, and keep all of the following in sync with
+   that same count: the `createOrReplaceTempView` calls in the `_sql`
+   function (one per input table), the `spark.createDataFrame` blocks in the
+   harness (one per input table), the two `check(...)` call sites (they stay
+   two — DSL and SQL — but each must pass every input table as an argument),
+   and the two commented Stage-4 lines (same rule). Leave the
+   `# >>> PASTE BEGIN` / `# >>> PASTE END` markers empty.
 5. Design exactly **one** deliberate trap: an edge case that passes under
    naive clean-data assumptions but fails on the test data. Seed the trap
    rows into the test data. The explanation goes **only** into
