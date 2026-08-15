@@ -22,9 +22,9 @@ Run after `/review`. This is the **only** command permitted to write into
      `## ETL scenario days`, created on first use, with columns:
      `Day | 层级 | 业务域 | Difficulty | Output table | 生产约束 | Trap / key edge case`.
      The `生产约束` column lists the `P#` lines verbatim. The trap column is
-     dense and specific — match the style of the existing rows, which name
-     the mechanism and the conditions under which the wrong answer passes
-     anyway.
+     dense and specific — match the style of the Day 1–21 rows in the
+     `Completed problems` table, which name the mechanism and the conditions
+     under which the wrong answer passes anyway.
    - Update the **scheduling matrix**, a section titled
      `## 调度矩阵（已用组合）` created on first use, with columns
      `Day | ETL layer | Domain | Failure mode`. `/newday` reads this to avoid
