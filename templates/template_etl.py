@@ -20,6 +20,11 @@ INPUT TABLES
 <table_c>(col: type, ...)   -- hand-maintained config table
 
 Render each input as a df.show()-style ASCII box with a header row.
+These boxes are the FULL test data, not a sample: every box must match the
+harness spark.createDataFrame rows exactly, and the Expected box below must
+match the `expected` list exactly. /genprompt ships the boxes and nothing
+else to the incognito AI — if they drift, the AI solves a different dataset
+and the Stage-4 AI checks fail for a reason unrelated to its solution.
 
 <table_a>:
 

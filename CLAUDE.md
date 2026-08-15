@@ -53,7 +53,7 @@ log/key_takeaways.md
 
 | Stage | Who | Command |
 |-------|-----|---------|
-| 1 SOLVE    | user implements `solve_dsl` + `solve_sql`, runs tests | `/newday` produced the file |
+| 1 SOLVE    | user implements the two Part 1 functions, runs tests | `/newday` produced the file |
 | 2 GENERATE | user gets an independent AI solution in a **separate incognito conversation** | `/genprompt` |
 | 3 REVIEW   | user pastes AI code into Part 3, reviews **by reading only**, commits a VERDICT before running | — |
 | 4 VERIFY   | user uncomments the Stage-4 lines and runs | — |
@@ -84,7 +84,8 @@ stages, one hidden trap, and 2–3 production constraints written openly in the
 problem statement as `P1/P2/P3`.
 
 **Technique whitelist** (these recur; none is ever "the topic" again):
-window `row_number` dedup / Top-N / `lag` / `lead` / running sum; ROWS vs
+window `row_number` dedup / Top-N / `lag` / `lead` / running sum, replay
+counting, `dropDuplicates` is not a contract; ROWS vs
 RANGE frames; inner / left / anti / semi joins, `broadcast`, nullable keys
 (`<=>` vs sentinel), orphan keys; conditional aggregation, `GROUPING SETS`,
 `COUNT(*)` vs `COUNT(col)`; UTC→local bucketing, date-dimension spine
@@ -93,7 +94,8 @@ sessionization, run-based version splitting; SCD2 half-open intervals,
 upsert; `explode_outer`, `collect_set`, dot-path access, array&lt;struct&gt;
 `filter` / `size` / `aggregate`; NULL-ignoring aggregates, `NOT IN`
 three-valued logic, window NULL ordering; pivot / unpivot; salting plus
-two-phase aggregation; `explain()` Exchange counting, broadcast detection,
+two-phase aggregation and the AQE skew thresholds; `explain()` Exchange
+counting, broadcast detection,
 the partition-key subset rule; `regexp_extract` / `regexp_replace` / `split`.
 
 **Blacklist — never schedule:** the `try_*` family (`try_cast` /

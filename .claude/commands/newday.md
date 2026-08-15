@@ -13,9 +13,21 @@ Generate the next day's practice problem. Do **not** solve it.
    - **Day 21 and earlier style (single-technique days) is retired from Day 22
      on.** From Day 22, every day is one complete production ETL pipeline
      built from already-covered techniques.
+   - **Precedence — the roadmap still schedules, the axes only shape.** If
+     "Scheduled next" in `log/problem_log_and_roadmap.md` names a candidate,
+     or it points at an open backlog item, honor it. Do not replace it with a
+     free axis pick: express that topic **as a cell on the three axes** (which
+     ETL layer is this job, which domain skins it, which failure mode hides
+     the trap) and build the pipeline around it. Only when "Scheduled next" is
+     empty and no backlog item is open do you pick all three axes freely.
+     Per the transition plan, **Day 22 is MERGE INTO / upsert at the L4
+     incremental layer** — the last high-value backlog item, and a topic the
+     user already knows from Day 17, which is what makes it a safe first test
+     of the ETL template.
    - Pick one cell from each of the three axes, and check the scheduling
      matrix in `log/problem_log_and_roadmap.md` so no (layer, domain,
-     failure mode) combination repeats:
+     failure mode) combination repeats (the matrix is created by `/digest` on
+     first use — if the section is absent, no combination has been used yet):
      - **ETL layer** (the main axis — what shape of job this is):
        L1 landing cleanup / L2 detail modeling / L3 serving / L4 incremental
      - **Business domain** (the skin — rotate, avoid recent repeats):
@@ -24,6 +36,17 @@ Generate the next day's practice problem. Do **not** solve it.
      - **Failure mode** (the trap source — NEVER stated in the day file):
        replay / late data / dimension drift / metric drift / nullable key /
        empty collection / boundary closure / skew / decomposability
+   - **The declared `P#` constraints must never name or restate the selected
+     failure mode.** The constraint menu and the failure-mode axis overlap
+     near-verbatim in three places — `replay` vs "upstream replay dedup",
+     `late data` vs "late-arriving data attributed to the event date",
+     `metric drift` vs "one metric computed identically everywhere". Picking
+     the matching pair publishes the trap axis in the day file, and
+     `/genprompt` then forwards it to the incognito AI as a public
+     requirement, which zeroes out the Stage-3 blind review. Constraints are
+     the requirements the trap hides **behind**, never a description of it.
+     If the natural constraint for this job would restate the trap axis, pick
+     a different constraint.
    - Compose the job from the technique whitelist in `CLAUDE.md`. Do not
      introduce an operator the user has never used — from Day 22 the day is
      about composing known techniques, not learning a new one.
@@ -42,8 +65,10 @@ Generate the next day's practice problem. Do **not** solve it.
    output table and its grain, the **numbered production constraints
    (P1/P2/P3)** you intend to declare, the pipeline stage count and resulting
    difficulty, and one line on which logged takeaway this day echoes.
-   **Never report the failure mode** — that is the trap. Wait for
-   confirmation before writing.
+   **Never report the failure mode** — that is the trap. For Day 21 (the last
+   v2-template day) drop the ETL-only items: report day number, topic,
+   expected output and its grain, difficulty, and the echoed takeaway. Wait
+   for confirmation before writing.
 4. On confirmation, write two files:
    - **Day 21 only** (the last single-technique day, already scheduled as
      unpivot): use `templates/template_v2.py` + `templates/template_ref.md`
@@ -51,9 +76,9 @@ Generate the next day's practice problem. Do **not** solve it.
      `<= 15` rows, no production constraints. From Day 22 on this branch is
      dead; delete it once Day 21 is generated.
    - **Day 22 onward:**
-   - `days/dayNN_<slug>.py` — from `templates/template_etl.py`
-   - `refs/dayNN_<slug>_ref.md` — from `templates/template_etl_ref.md`
-     (NOT in `days/` — the sealed answers live in the sibling `refs/` dir)
+     - `days/dayNN_<slug>.py` — from `templates/template_etl.py`
+     - `refs/dayNN_<slug>_ref.md` — from `templates/template_etl_ref.md`
+       (NOT in `days/` — the sealed answers live in the sibling `refs/` dir)
    Rename every placeholder identifier: `table_a` / `table_b` become the real
    input table names, and `build_output_table_dsl` / `build_output_table_sql`
    become `build_<output_table>_dsl` / `build_<output_table>_sql`. The
@@ -75,7 +100,13 @@ Generate the next day's practice problem. Do **not** solve it.
 7. Remind the user to run `/clear` before starting Stage 1, since the
    reference content is in context right now.
 
-## Constraints on the generated day file
+## Constraints on the generated day file (Day 22 onward)
+
+**For Day 21 this whole section is ignored** — the pre-Day-22 constraints
+named in step 4 apply instead (single `df` parameter, `class Solution` with
+`solve_dsl` / `solve_sql` methods, the four `template_v2.py` docstring blocks
+PROBLEM / INPUT SCHEMA / EXPECTED OUTPUT / EXAMPLE, `<= 15` rows, no
+production constraints).
 
 - The docstring carries all four PROBLEM blocks: BUSINESS CONTEXT (1–2
   sentences), INPUT TABLES (3–4 tables, each with its upstream nature noted:
@@ -88,6 +119,12 @@ Generate the next day's practice problem. Do **not** solve it.
   date, upstream replay dedup, one metric computed identically everywhere,
   data-quality assertions (primary-key uniqueness, row count, non-null rate),
   reading only the necessary partitions and columns.
+  **No `P#` may name or restate the selected failure mode.** Three menu items
+  above shadow a failure-mode axis cell almost word for word (replay dedup /
+  `replay`, event-date attribution / `late data`, one-metric-everywhere /
+  `metric drift`). Declaring the shadow of today's trap axis publishes the
+  trap — `/genprompt` copies `P#` verbatim into the incognito prompt. When
+  the natural constraint collides with the trap axis, pick a different one.
 - Part 1 holds exactly **two module-level functions** — no class. Body is
   `pass` + `# TODO: implement` + a one-line hint in the docstring. Nothing
   else. Do not split the job into more functions: SQL cannot mirror the split,
@@ -98,11 +135,22 @@ Generate the next day's practice problem. Do **not** solve it.
   never a pre-filled solution.
 - Part 5 in the day file contains only the unanswered "Review takeaways"
   prompts. Concept takeaways go in `refs/dayNN_<slug>_ref.md`.
-- The EXAMPLE boxes render every table as a `df.show()`-style ASCII box with
-  a header row — one box per input table, one for the expected output. Never
+- The ASCII boxes live inside the existing `INPUT TABLES` and `OUTPUT
+  CONTRACT` blocks — do **not** add a fifth `EXAMPLE` block; that block name
+  belongs to `template_v2.py`. Render every table as a `df.show()`-style
+  ASCII box with a header row — one box per input table under `INPUT TABLES`,
+  one for the expected output under `OUTPUT CONTRACT`. Never
   bare tuples or prose rows: without column headers the reader cannot tell
   which value is which column. Per-row annotations go under the box as notes,
   not inside the cells.
+- **The boxes are the full test data, not a sample.** Every input box must
+  reproduce the harness `spark.createDataFrame` rows exactly — same rows,
+  same order of columns, same values — and the expected box must reproduce
+  the `expected` list exactly. `/genprompt` sends the boxes and nothing else
+  to the incognito AI, so any drift means the AI solves a different dataset
+  and the Stage-4 AI checks fail for a reason that has nothing to do with the
+  solution, destroying the verification signal. After writing the harness,
+  re-read the boxes against it row by row.
 - Test data: **each input table <= 8 rows, all inputs together <= 25 rows**,
   including the trap rows. Small enough to reason about by hand.
 - `expected` must be hand-derived row by row, not produced by running a
@@ -111,7 +159,12 @@ Generate the next day's practice problem. Do **not** solve it.
 - If the scenario touches dates, pin `spark.sql.session.timeZone` in the
   harness (the template already does).
 
-## Constraints on the reference file
+## Constraints on the reference file (Day 22 onward)
+
+**For Day 21 this section is ignored too** — that day's reference comes from
+`templates/template_ref.md`, which has no failure-mode line, no
+production-constraint audit table and no pipeline-stage list. Fill the
+sections that template actually has.
 
 - Fill the **failure mode** line — it is recorded here and nowhere else.
 - Fill the **production-constraint audit table**: one row per `P#`, naming

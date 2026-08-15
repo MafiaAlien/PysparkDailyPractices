@@ -49,5 +49,9 @@ Run after `/review`. This is the **only** command permitted to write into
 4. Wait for approval, then apply with targeted edits — not a full-file
    rewrite. `log/04` is long; a rewrite risks silent loss.
 
-5. Finish with a one-line proposal for the next day's topic, consistent with
-   the difficulty cadence, and reflect it in "Scheduled next".
+5. Finish with a one-line proposal for the next day's topic and reflect it in
+   "Scheduled next" — `/newday` reads that line first and shapes it onto the
+   three axes, so it is the handoff, not a note to self. For an ETL scenario
+   day, difficulty is the **pipeline stage count** (3 = Medium, 4–5 =
+   Medium-Hard, 6+ = Hard), not the old single-technique difficulty cadence;
+   propose a stage count rather than invoking that cadence.
