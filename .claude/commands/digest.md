@@ -15,12 +15,23 @@ Run after `/review`. This is the **only** command permitted to write into
    yet.**
 
    **`log/03`:**
-   - one new row in "Completed problems": `Day | Topic | Difficulty |
-     Problem | Trap / key edge case`. The trap column is dense and specific —
-     match the style of the existing rows, which name the mechanism and the
-     conditions under which the wrong answer passes anyway.
-   - update "Scheduled next"
-   - update any backlog line this day closes out or partially closes
+   - **Day 1–21 rows are frozen.** Do not back-fill the new columns into the
+     existing "Completed problems" table — those rows' `Topic` column is not
+     the same thing as `层级 / 业务域`, and migrating them loses information.
+   - For Day 22 onward, append to a **separate table** titled
+     `## ETL scenario days`, created on first use, with columns:
+     `Day | 层级 | 业务域 | Difficulty | Output table | 生产约束 | Trap / key edge case`.
+     The `生产约束` column lists the `P#` lines verbatim. The trap column is
+     dense and specific — match the style of the existing rows, which name
+     the mechanism and the conditions under which the wrong answer passes
+     anyway.
+   - Update the **scheduling matrix**, a section titled
+     `## 调度矩阵（已用组合）` created on first use, with columns
+     `Day | ETL layer | Domain | Failure mode`. `/newday` reads this to avoid
+     repeating a combination. The failure mode is recorded here and in the
+     reference file only — never in the day file.
+   - Update "Scheduled next"
+   - Update any backlog line this day closes out or partially closes
 
    **`log/04`:**
    - only content that is genuinely **new**, or that **corrects** an existing
