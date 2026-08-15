@@ -129,20 +129,72 @@ performance 档。
 3. 输出契约 —— 列名 + 类型 + **粒度**（一行代表什么）+ 排序无关
 4. 生产约束 —— 编号列出 2–3 条
 
-**签名改为多表**（这是全项目第一次偏离单表 `df`）：
+**丢弃 `class Solution`，改为模块级函数，按输出表命名。**
+
+`class Solution` 是 LeetCode / Codility 平台的产物，`self` 从未被使用，生产里
+没有人为一段 ETL 建类。但**函数边界要保留**：输入表以参数注入、输出返回
+DataFrame、函数体内不读路径不写盘——这恰恰是生产 ETL "有单测时"的标准形状。
+更硬的约束是，完全平铺的脚本只会留下一个 `result_df`，无法让用户解与 AI 解
+并存于同一个 harness，D4（保留 Stage 2–4 盲审）会直接落空。
+
+函数名跟随**输出表**，逐日不同：
 
 ```python
-class Solution:
-    def solve_dsl(self, orders: DataFrame, stores: DataFrame,
-                  fx_rates: DataFrame) -> DataFrame: ...
+def build_daily_store_revenue_dsl(
+    orders: DataFrame,
+    stores: DataFrame,
+    fx_rates: DataFrame,
+) -> DataFrame: ...
 
-    def solve_sql(self, spark: SparkSession, orders: DataFrame,
-                  stores: DataFrame, fx_rates: DataFrame) -> DataFrame: ...
+
+def build_daily_store_revenue_sql(
+    spark: SparkSession,
+    orders: DataFrame,
+    stores: DataFrame,
+    fx_rates: DataFrame,
+) -> DataFrame: ...
 ```
 
-参数名即业务表名，逐日不同。`solve_sql` 里为每张表各建一个临时视图。
-Part 1 仍然只有这**两个方法**，不拆多步——拆了 SQL 侧对不齐，真实提交的也是
-一段作业。
+参数名即业务表名。`_sql` 版本为每张输入表各建一个同名临时视图。Part 1 仍然
+只有这**两个函数**，不拆多步——拆了 SQL 侧对不齐，真实提交的也是一段作业。
+AI 解用同名加 `ai_` 前缀。
+
+**文件区块顺序重排 + 显式分隔横幅。**
+
+模板 v2 有一个结构缺陷：`# Part 3 — AI Review` 占位符位于
+`if __name__ == "__main__":` **之后**，而 `__main__` 里的 Stage-4 调用需要
+`ai_*` 已定义——照字面粘贴会 `NameError`。实际使用中（day19 line 193、
+day20 line 218）用户把代码粘在 `__main__` 之前，与横幅和 REVIEW_NOTES
+相隔整个 harness。新模板修正为：
+
+```
+docstring: PROBLEM 四块 + WORKFLOW
+imports
+
+╔══ PART 1 — YOUR JOB ════════════════════════════════════╗
+│  Stage 1 只写这一段，本文件其余部分不要改。              │
+╚═════════════════════════════════════════════════════════╝
+  ── 1a. DataFrame API ──
+  def build_<table>_dsl(...)
+  ── 1b. Spark SQL ──
+  def build_<table>_sql(spark, ...)
+╔══ END OF PART 1 ════════════════════════════════════════╝
+
+╔══ PART 3 — PASTE THE INCOGNITO ANSWER BELOW ════════════╗
+│  UNMODIFIED。两个函数，ai_ 前缀，签名与 Part 1 一致。    │
+│  不要改格式、不要顺手修 bug——那是 Stage 3 要审的东西。   │
+╚═════════════════════════════════════════════════════════╝
+  # >>> PASTE BEGIN
+  # >>> PASTE END
+
+  REVIEW_NOTES  ← 紧贴粘贴区，不再隔着 harness
+  VERDICT
+
+Part 2 — harness（check() + __main__，不要编辑）
+  含 Stage-4 注释行，此时 ai_* 已定义，取消注释即可运行
+
+Part 5 — Review takeaways
+```
 
 **REVIEW_NOTES 增加 Production 栏**，并按新的严重度顺序排列：
 
@@ -156,8 +208,6 @@ Part 1 仍然只有这**两个方法**，不拆多步——拆了 SQL 侧对不�
 [ ] Robustness
 [ ] Style/clarity
 ```
-
-**Stage-4 注释行**跟随多表签名一起改。
 
 ### 7.2 新增 `templates/template_etl_ref.md`
 
@@ -185,7 +235,8 @@ Part 1 仍然只有这**两个方法**，不拆多步——拆了 SQL 侧对不�
 
 - "What to read" 增加：多张输入表的 schema 全部照抄
 - 两行硬编码签名 `ai_solve_dsl(df: DataFrame)` 改为
-  **"照抄当日文件 Part 1 的方法签名，参数名与顺序完全一致，函数名加 `ai_` 前缀"**
+  **"照抄当日文件 Part 1 的两个函数签名，函数名、参数名与顺序完全一致，
+  仅加 `ai_` 前缀"**（函数名逐日不同，不得硬编码）
 - 输出块必须包含 spec 里编号的生产约束 `P1/P2/P3`（它们是公开需求，不是提示）
 - 不得包含的清单保持不变
 
