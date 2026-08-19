@@ -29,31 +29,65 @@
 > Stage 2–4 的 AI review **不再补做**,`days/day16_null_semantics.py` 的 Part 3
 > 保持为空。
 
+## ETL scenario days
+
+> Day 1–21 的 `Completed problems` 表按"当日新技术"组织,与本表的三轴不是同一
+> 回事,**不回填、不迁移**。Day 22 起的行只进本表。
+
+| Day | 层级 | 业务域 | Difficulty | Output table | 生产约束 | Trap / key edge case |
+|-----|------|--------|-----------|--------------|----------|----------------------|
+| 22 | L4 incremental | subscription billing | Medium-Hard (5 stages) | `dim_subscription` | P1. Re-running this job on the same two inputs must produce byte-identical output. The batch is replayed whenever the scheduler retries.<br>P2. Every output row's `mrr` must come from `plan_catalog`. The `mrr` the change feed carries is advisory — upstream computes it independently and it is not the system of record.<br>P3. A subscription deleted in this batch (`op = 'D'`) must not appear in the output at all. | **一条变更不会自动比它落在的目标行新**是全题靶心:SUB2 的 `change_ts = 2026-08-17 10:00:00` 落在 `updated_at = 2026-08-17 18:30:00` 的行上,无防护应用会把订阅从 PRO **静默回滚**成 BASIC。失败形状极隐蔽:行数对、无 NULL、无重复,降级本身是正常业务事件,5 行里 4 行正确而错的那行**看不出错**;两个时间戳同为 8-17 只差几小时(其余变更全是 8-18),日期级目测抓不到。唯一读时信号是 **`updated_at` 会倒着走**(维表 last-updated 能变小 = 无防护 merge 的签名)。两条正解结构不同:**Route A 显式守卫**(`change_ts > target.updated_at`,可审计)vs **Route B 让目标行进同一排序竞争**(无 staleness 谓词,守卫**涌现**;反面是一旦 union 少了目标行或统一错了列,保护静默消失且**没有一行代码会缺**)。P1 **测试数据分辨不出 `>` 与 `>=`**(每个 key 时间戳互异),别给严格性记功;P2 忽略则 SUB3 输出 55.0 而非 100.0(feed 的 advisory 值恰好只在这一行错);P3 的墓碑必须从upsert 集与幸存目标集**两处**移除,只写 `op <> 'D'` 会删掉墓碑却留下目标行 = 订阅复活。**扰动实测(测试数据全绿)**:stale DELETE 与"同批先 D 后 I 重建"两种输入下,user-SQL 的 `NOT EXISTS (... op='D')` 抹掉整个 key,其余五份实现全部保留或重建——用户两半实现了不同语义,且**用户 SQL 才是 P3 的字面读法**,参考实现比自己的措辞宽松;plan 缺失于目录时四份解法 left join 产出 `mrr = NULL`(下游 SUM 静默吞成 0),ref 两路 inner join 整行丢弃,无一份写断言。**AI 未踩陷阱**(显式 Route A),且 P1 上**强于用户与参考答案**:五键全序 tie-break 保证平局也确定,用户两版与 ref 都只有单键。**用户 Stage-1 走 Route B 结构性免疫,但 REVIEW 未触及 trap 轴**——Correctness 栏裸 LGTM,反把 tie-break 标成"可能冗余",注意力刚好放反。PLAN(实测,AQE off):ref-B **2** Exchange / user-DSL **3**(多开一个窗口:CDC 先收敛一次、union 后再排一次,Route B 本可合并成一个)/ AI-DSL **4** / ref-A **9**(四路分叉未缓存,Scan **12** 次是真账)。`full_outer` 改 `left` 实测丢 SUB6(4 行 vs 5 行)且 **Exchange 同为 4**——零收益的正确性回归 |
+
+## 调度矩阵(已用组合)
+
+> `/newday` 读这张表来避免重复三轴组合。failure mode **只**记在这里和
+> `refs/*_ref.md`,**永远不进 day 文件**。
+
+| Day | ETL layer | Domain | Failure mode |
+|-----|-----------|--------|--------------|
+| 22 | L4 incremental | subscription billing | late data |
+
 ## Supplemental drills completed
 - Pivot mini-drills x5 (script form, no class): explicit values list,
   schema drift without list, values-list-as-filter, multi-agg column
   naming, pivot -> unpivot round trip (stack / unpivot).
 
 ## Scheduled next (planned cadence, Medium / Medium-Hard)
-- **先行 drill(NEXT IN QUEUE,先于 Day 21)**:unpivot / melt mini-drills
-  (`stack` / `DataFrame.unpivot`,约 15 分钟,进 Supplemental drills)。
-  **无 trap、无 review 闭环**,只跑通签名与基本语义:DSL 的
-  `df.unpivot(ids, values, variableColumnName, valueColumnName)` vs SQL 的
-  `stack(n, 'k1', v1, ...)` 与 `UNPIVOT` 子句、NULL 值列的默认丢弃行为、
-  多度量组同时 unpivot、`pivot -> unpivot` 往返。
-- Day 21 — candidate: **unpivot / melt 作为一等主题**(宽表转长表:列名解析成
-  维度、NULL 值列的丢弃语义、多度量组)。Medium。理由:backlog 里唯一
-  "只在补充练习里碰过、从未作为当日主题"的条目;Day 3 做过 pivot 正向,
-  反向从未单独 drill。难度从 Day 20 (M-H) 回落到 M,符合节奏。
-  **前置条件:上面那个 drill 必须先做完**——unpivot 的 API 面极小(两个调用),
-  一个 drill 就能完全关闭"不知道怎么调"这一层,剩下的语义空间足够撑起一个
-  靠读能抓到的 trap。这正是 Day 20 缺的结构。
-- 备选(primitives 全是已知的,不需要 drill):session_window 内置函数 vs
-  Day 13 手搓的 lag+running-sum 会话化——语义 Day 13 已吃透,内置版的边界约定
-  不同(`<` 而非 `<=`、`end = last + gap`,已记在 Day 13 行),trap 天然落在
-  "两种约定的差异"上,纯语义。缺点:有与 Day 13 重复的风险。
-- Later candidates: MERGE INTO / Delta-style upsert against an existing dim
-  table (Day 17 built history from a feed, never merged into a target);
+### 模式切换(2026-08-18 记录,追溯 2026-08-15 的分支合并)
+**Day 21 从未生成。** Day 22 起进入 ETL scenario 模式(见 CLAUDE.md
+"Problem mode — Day 22 onward"),下面这段 Day-21 计划**整体 SUPERSEDED**,
+保留作为决策记录:
+
+> ~~先行 drill(NEXT IN QUEUE,先于 Day 21):unpivot / melt mini-drills
+> (`stack` / `DataFrame.unpivot`,无 trap、无 review 闭环)。~~
+> ~~Day 21 — candidate: unpivot / melt 作为一等主题(宽表转长表:列名解析成
+> 维度、NULL 值列的丢弃语义、多度量组)。Medium。前置条件是上面那个 drill。~~
+> ~~备选:session_window 内置函数 vs Day 13 手搓的 lag+running-sum 会话化。~~
+>
+> 作废理由(两条,均在 Day 19/20 的行里有实证):剩余 backlog 已漂向
+> **低生产价值的 API**;且 Day 19 与 Day 20 的 trap 维度**双双失效**——
+> Stage 1 退化成 API 教学,陷阱必须讲破才能完成 Stage 1。单技术日的形式
+> 本身是这两个失败的共因,故整体退役。**那个 unpivot drill 也未执行。**
+
+### NEXT(Day 23)
+- **Day 23 — L3 aggregation / marketplace orders / failure mode: fan-out
+  double counting。4 stages -> Medium-Hard。** 事实表 join 一张**每个 key
+  不止一行**的维度表(生效期重叠的价目表 / 一个 seller 多个 region 归属),
+  join 在聚合**之前**静默把事实行翻倍,金额被重复计数。选它的三条理由:
+  (1) 三轴与 Day 22 **完全不重叠**(L4->L3、billing->marketplace、
+  late data->fan-out);(2) fan-out 的失败形状与 Day 22 同族——**行数对、
+  无 NULL、金额偏大但"看起来是个合理的数"**,靠读能抓,靠跑抓不到;
+  (3) 所需 primitive 全部已练过(join 类型、`row_number` 去重、
+  conditional aggregation、`COUNT(*)` vs `COUNT(col)`、broadcast),
+  **Stage 1 不需要现学任何函数**,不会重演 Day 19/20 的失效。
+- 后续候选(尚未排期,均与 Day 22 三轴不重叠):
+  L2 cleansing / IoT telemetry / **duplicate replay**;
+  L3 aggregation / ad delivery / **timezone attribution**(复用 Day 11
+  的 UTC->local 但把它放进多阶段管道);
+  L4 incremental / inventory / **orphan keys**(层级与 Day 22 相同,
+  故失败模式与业务域必须同时换)。
+- Later candidates (pre-switch list, kept for reference): MERGE INTO /
+  Delta-style upsert against an existing dim table — **CLOSED by Day 22**;
   the remaining array/map HOF family (zip_with / transform_keys /
   transform_values / map_filter) as a Day-19 sequel;
   date/time round 4 — DST-crossing tz math (a full Day-15-shaped script exists
@@ -72,6 +106,10 @@ trap 维度不产生有效信号(Day 20 的实际结果;Day 19 是部分版本�
 `transform` 在 Day 14 记过,属"已知 API + 未知边界",陷阱仍在 Stage 1 丢失)。
 判据不是"这个主题做过没有"(backlog 里的条目按定义全都没做过),而是
 **Stage 1 是否需要现学一个函数是干什么的**。
+**Day 22 起这条判据由技术白名单直接承担**:ETL scenario 日只用已练过的技术
+组合,所以"要不要先出 drill"这个问题原则上不再出现。难度改由 **pipeline
+stage 数**决定(3 = Medium,4–5 = Medium-Hard,6+ = Hard),不再走
+Easy/Medium/Medium-Hard 的交替节奏。
 
 ## Backlog (rotate, alternate difficulty, avoid recent repeats)
 - Complex aggregation: multiple grains in one pass, grouping sets /
@@ -99,6 +137,8 @@ trap 维度不产生有效信号(Day 20 的实际结果;Day 19 是部分版本�
   两层反斜杠转义(`'\$'` 静默失效 / `'\\$'` 才对 / `[$,]` 两层都绕开)已实操;
   `regexp_extract` 只在 AI 解法里出现过,`split` / 句级解析仍 OPEN
 - Unpivot / melt as the primary topic (only touched in drills)
+  <- **RETIRED**(2026-08-18,随单技术日模式一起退役;那个前置 drill 也未执行,
+  不再作为正式日主题)
 - Date/time deep dive: timezones, timestamps, truncation, ranges,
   calendar join against a date dimension   <- Day 11 DONE (UTC->local
   bucketing + date-dim spine gap-fill); Day 13 DONE (gap-threshold
@@ -113,6 +153,10 @@ trap 维度不产生有效信号(Day 20 的实际结果;Day 19 是部分版本�
   (run-based versioning + half-open interval closing; MERGE INTO / Delta-style
   upsert against an existing dim table still OPEN — this day built history from
   a feed, it never merged into a target)
+  <- **Day 22 DONE**(CDC 批次 merge 进已有维表:staleness guard 的两种形态
+  ——显式谓词 vs 目标行进排序竞争;墓碑必须从 upsert 集与幸存目标集**两处**
+  移除;"system of record 是契约问题不是数据问题")。**Delta 的 `MERGE INTO`
+  语句本身仍未实操**——本项目是内存 DataFrame,不模拟真实 parquet 分区目录
 - Skew handling: salting, AQE skew join   <- Day 18 DONE (salted join +
   two-phase agg + decomposability; AQE skew join 只读到配置与两道触发门槛,
   14 行数据上无法触发 OptimizeSkewedJoin —— 真实倾斜数据上的 AQE 行为仍 OPEN)

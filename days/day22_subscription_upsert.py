@@ -152,7 +152,64 @@ def build_dim_subscription_dsl(
     Hint: decide what a change is allowed to do to the row it lands on.
     """
     # TODO: implement
-    pass
+    window_most_recent_updated = (
+        Window.partitionBy(F.col('subscription_id'))
+        .orderBy(F.col('updated_at').desc())
+        )
+    
+    valid_subscription_cdc = (
+        subscription_changes
+        .withColumnRenamed(
+            'change_ts',
+            'updated_at'
+        )
+        .withColumn(
+            'ts_rn',
+            F.row_number().over(window_most_recent_updated)
+        )
+        .filter(F.col('ts_rn') == 1)
+        .select(
+            'subscription_id',
+            'op',
+            'plan',
+            'status',
+            'mrr',
+            'updated_at'
+        )
+    )
+    d_with_op = dim_subscription_current.withColumn(
+                'op',
+                F.lit('U')
+            ).alias('d')
+
+    upsert_cdc = (
+        valid_subscription_cdc.alias('v')
+        .unionByName(
+            d_with_op
+        )
+        .withColumn(
+            'updated_rn',
+            F.row_number().over(window_most_recent_updated)
+        )
+        .filter((
+            F.col('updated_rn') == 1) | (F.col('updated_at').isNull())
+            )
+        .filter(F.col('op') != 'D')
+        .join(
+            F.broadcast(plan_catalog.alias('p')),
+            on='plan',
+            how='left'
+        )
+        .select(
+            'subscription_id',
+            F.col('plan').alias('plan'),
+            F.col('status').alias('status'),
+            F.col('p.mrr').alias('mrr'),
+            F.col('updated_at')
+        )
+    )
+    return upsert_cdc
+
 
 
 # ------------------------------ 1b. Spark SQL ------------------------
@@ -172,6 +229,81 @@ def build_dim_subscription_sql(
 
     sql = """
         -- write your SQL here
+        WITH rn_subscription_cdc AS (
+            SELECT 
+                *,
+                ROW_NUMBER()OVER(PARTITION BY subscription_id ORDER BY change_ts DESC) as rn
+            FROM 
+                subscription_changes
+        ),
+
+        get_most_updated_cdc AS (
+            SELECT 
+                subscription_id,
+                op,
+                plan,
+                status,
+                mrr,
+                change_ts AS updated_at
+            FROM 
+                rn_subscription_cdc
+            WHERE rn = 1
+        ),
+
+        d_with_op AS (
+            SELECT 
+                *,
+                'U' AS op
+            FROM 
+                dim_subscription_current
+        ),
+
+        union_by_name AS (
+            SELECT  
+                subscription_id,
+                op,
+                plan,
+                status,
+                mrr,
+                updated_at
+            FROM 
+                get_most_updated_cdc
+            UNION ALL 
+            SELECT 
+                subscription_id,
+                op,
+                plan,
+                status,
+                mrr,
+                updated_at
+            FROM 
+                d_with_op
+        ),
+
+        retrieve_most_recent AS (
+            SELECT 
+                subscription_id,
+                plan,
+                status,
+                mrr,
+                updated_at,
+                ROW_NUMBER()OVER(PARTITION BY subscription_id ORDER BY updated_at DESC) AS rn
+            FROM 
+                union_by_name u
+            WHERE NOT EXISTS (SELECT 1 FROM subscription_changes s WHERE u.subscription_id = s.subscription_id AND s.op = 'D' )
+        )
+
+        SELECT 
+            /*+ BROADCAST(p) */
+            r.subscription_id,
+            r.plan,
+            r.status,
+            p.mrr,
+            r.updated_at
+        FROM 
+            retrieve_most_recent r LEFT JOIN plan_catalog p ON r.plan = p.plan
+        WHERE rn = 1 
+
     """
     return spark.sql(sql)
 
@@ -192,7 +324,134 @@ def build_dim_subscription_sql(
 # #####################################################################
 
 # >>> PASTE BEGIN
+def ai_build_dim_subscription_dsl(
+    dim_subscription_current: DataFrame,
+    subscription_changes: DataFrame,
+    plan_catalog: DataFrame,
+) -> DataFrame:
+    ordering = Window.partitionBy("subscription_id").orderBy(
+        F.col("change_ts").desc(),
+        F.col("op").desc_nulls_last(),
+        F.col("plan").desc_nulls_last(),
+        F.col("status").desc_nulls_last(),
+        F.col("mrr").desc_nulls_last(),
+    )
 
+    latest = (
+        subscription_changes.withColumn("_rn", F.row_number().over(ordering))
+        .filter(F.col("_rn") == F.lit(1))
+        .select(
+            F.col("subscription_id"),
+            F.col("op").alias("_op"),
+            F.col("plan").alias("_plan"),
+            F.col("status").alias("_status"),
+            F.col("change_ts").alias("_change_ts"),
+        )
+    )
+
+    joined = dim_subscription_current.join(latest, on="subscription_id", how="full_outer")
+
+    applies = F.col("_change_ts").isNotNull() & (
+        F.col("updated_at").isNull() | (F.col("_change_ts") > F.col("updated_at"))
+    )
+
+    merged = (
+        joined.filter(~(applies & (F.col("_op") == F.lit("D"))))
+        .filter(F.col("updated_at").isNotNull() | applies)
+        .select(
+            F.col("subscription_id"),
+            F.when(applies, F.col("_plan")).otherwise(F.col("plan")).alias("plan"),
+            F.when(applies, F.col("_status")).otherwise(F.col("status")).alias("status"),
+            F.when(applies, F.col("_change_ts")).otherwise(F.col("updated_at")).alias("updated_at"),
+        )
+    )
+
+    return merged.join(plan_catalog, on="plan", how="left").select(
+        F.col("subscription_id").cast("string").alias("subscription_id"),
+        F.col("plan").cast("string").alias("plan"),
+        F.col("status").cast("string").alias("status"),
+        F.col("mrr").cast("double").alias("mrr"),
+        F.col("updated_at").cast("string").alias("updated_at"),
+    )
+
+
+def ai_build_dim_subscription_sql(
+    spark: SparkSession,
+    dim_subscription_current: DataFrame,
+    subscription_changes: DataFrame,
+    plan_catalog: DataFrame,
+) -> DataFrame:
+    dim_subscription_current.createOrReplaceTempView("dim_subscription_current_v")
+    subscription_changes.createOrReplaceTempView("subscription_changes_v")
+    plan_catalog.createOrReplaceTempView("plan_catalog_v")
+
+    return spark.sql(
+        """
+        WITH ranked AS (
+            SELECT
+                subscription_id,
+                op,
+                plan,
+                status,
+                change_ts,
+                ROW_NUMBER() OVER (
+                    PARTITION BY subscription_id
+                    ORDER BY change_ts DESC,
+                             op DESC NULLS LAST,
+                             plan DESC NULLS LAST,
+                             status DESC NULLS LAST,
+                             mrr DESC NULLS LAST
+                ) AS rn
+            FROM subscription_changes_v
+        ),
+        latest AS (
+            SELECT subscription_id, op, plan, status, change_ts
+            FROM ranked
+            WHERE rn = 1
+        ),
+        merged AS (
+            SELECT
+                COALESCE(c.subscription_id, n.subscription_id) AS subscription_id,
+                CASE
+                    WHEN n.change_ts IS NOT NULL
+                         AND (c.updated_at IS NULL OR n.change_ts > c.updated_at)
+                    THEN n.plan ELSE c.plan
+                END AS plan,
+                CASE
+                    WHEN n.change_ts IS NOT NULL
+                         AND (c.updated_at IS NULL OR n.change_ts > c.updated_at)
+                    THEN n.status ELSE c.status
+                END AS status,
+                CASE
+                    WHEN n.change_ts IS NOT NULL
+                         AND (c.updated_at IS NULL OR n.change_ts > c.updated_at)
+                    THEN n.change_ts ELSE c.updated_at
+                END AS updated_at
+            FROM dim_subscription_current_v c
+            FULL OUTER JOIN latest n
+              ON c.subscription_id = n.subscription_id
+            WHERE NOT (
+                      n.change_ts IS NOT NULL
+                      AND (c.updated_at IS NULL OR n.change_ts > c.updated_at)
+                      AND n.op = 'D'
+                  )
+              AND (
+                      c.subscription_id IS NOT NULL
+                      OR (n.change_ts IS NOT NULL
+                          AND (c.updated_at IS NULL OR n.change_ts > c.updated_at))
+                  )
+        )
+        SELECT
+            CAST(m.subscription_id AS STRING) AS subscription_id,
+            CAST(m.plan AS STRING) AS plan,
+            CAST(m.status AS STRING) AS status,
+            CAST(p.mrr AS DOUBLE) AS mrr,
+            CAST(m.updated_at AS STRING) AS updated_at
+        FROM merged m
+        LEFT JOIN plan_catalog_v p
+          ON m.plan = p.plan
+        """
+    )
 # >>> PASTE END
 
 # ---------------------------------------------------------------------
@@ -201,29 +460,29 @@ def build_dim_subscription_sql(
 #               > production robustness > performance > portability > style
 # ---------------------------------------------------------------------
 # [ ] Correctness — ties? nulls? empty groups? duplicate keys? boundary rows?
-#     notes:
+#     notes: LGTM
 # [ ] API usage — wrong signatures, hallucinated functions, deprecated calls,
 #     ambiguous column references in joins, SQL syntax slips?
-#     notes:
+#     notes: LGTM
 # [ ] ANSI behavior — does any COALESCE/fallback assume a NULL that ANSI mode
 #     will not deliver (cast, division, array index, element_at)?
-#     notes:
+#     notes: LGTM
 # [ ] Production — walk P1/P2/P3 one at a time, each on its own line.
 #     Re-run idempotent? Late data attributed to the event date? The same
 #     metric computed the same way in every branch? Quality assertions there?
-#     notes:
+#     notes: P1 & P2: line 358 - 359, P3: line 373, but it does not prove mrr is from plan_catalog(no table prefix), SQL part is ok
 # [ ] Performance — extra Exchange? extra scan? window without partitionBy?
 #     (reading-stage hypothesis only — verified with .explain() later,
 #     never asserted from memory)
-#     notes:
+#     notes: line 352 used full outer join, but I think left_join will be ok 
 # [ ] Robustness — hardcoded values, assumptions not in the output contract?
-#     notes:
+#     notes: line 333-337, not sure desc not null is robust code to handle NULL, if not ,I believe this is redundant code
 # [ ] Style/clarity — would you approve this in a real code review?
-#     notes:
+#     notes: LGTM
 #
-# VERDICT (commit before running): PASS / FAIL — because:
+# VERDICT (commit before running): PASS / FAIL — because: PASS, some part I think it is redundant but logic and syntax is correct
 # ACTUAL RESULT (after Stage 4 run):
-# GAP ANALYSIS: did the run reveal anything the reading missed?
+# GAP ANALYSIS: did the run reveal anything the reading missed? No
 
 
 # #####################################################################
@@ -316,12 +575,12 @@ if __name__ == "__main__":
     # Stage 4 — run the AI answer through the SAME harness.
     # Un-comment only AFTER committing a VERDICT in Part 3.
     # -----------------------------------------------------------------
-    # check(ai_build_dim_subscription_dsl(
-    #           dim_subscription_current, subscription_changes, plan_catalog),
-    #       expected, "AI-DSL (post-review verification)")
-    # check(ai_build_dim_subscription_sql(
-    #           spark, dim_subscription_current, subscription_changes, plan_catalog),
-    #       expected, "AI-SQL (post-review verification)")
+    check(ai_build_dim_subscription_dsl(
+              dim_subscription_current, subscription_changes, plan_catalog),
+          expected, "AI-DSL (post-review verification)")
+    check(ai_build_dim_subscription_sql(
+              spark, dim_subscription_current, subscription_changes, plan_catalog),
+          expected, "AI-SQL (post-review verification)")
 
     spark.stop()
 
