@@ -127,6 +127,52 @@
   表达式,要么把变换提到 CTE/子查询里(最干净——只有一份,不会漂移)。
   GROUP BY 写 alias 会**优先解析输入列**(静默改绑定)且不可移植。
 
+## Join 扇出(fan-out):在聚合之前发生的聚合 bug (Day 23 实测)
+- **join 不是查字典,是配对**:左表每一行与右表所有满足条件的行逐一配对,
+  右表有几行匹配,左行就被复制几份。把 join 想成"拿 key 去查一个值填回来"
+  是这个 bug 的心智根源。实测:7 行事实表 join 一张 `S3` 有两行的配置表 ->
+  **9 行**,`SUM(gross)` 从 585.0 变 705.0,而 `COUNT(DISTINCT order_id)`
+  仍是 7。
+- **join 把行乘出来,SUM 忠实地把它们加起来。** 错误发生在聚合**之前**,
+  等聚合算完,产生错误的那些重复行已经消失了——下游没有任何一步能检测到它。
+  唯一的修复位置是 **join 的右侧**。
+- **只有可加聚合会坏。** `SUM` / `COUNT(*)` / `AVG` 被放大;
+  `COUNT(DISTINCT k)` / `MIN` / `MAX` / `collect_set` 在重复下**幂等**,保持
+  正确。所以失败形状是**半对的一行**:计数对、金额错。这是 **Day 18 的镜像**
+  ——那里 `SUM` 可跨盐桶分解而 `COUNT(DISTINCT)` 不可,这里 `COUNT(DISTINCT)`
+  免疫而 `SUM` 不免疫。**同一个问题的两侧:先搞清哪些度量能活过你正在对行集
+  做的那个变换。**
+- **`n_orders` 这类 DISTINCT 计数是最危险的免疫者**:它恰好是人类拿来核对
+  "8 单去掉 1 个取消 = 7 单"的那一列。它对得上,旁边的金额是错的。
+- **输出形状断言抓不到数值级 bug**(Day 23,P2 实录):grain 唯一、非 NULL、
+  行数,在扇出下**全部不变**。作业写齐了断言、断言全过、错数字照发。真正能
+  覆盖的是**对账式断言**——join 之前在事实表上算的 `SUM(gross)` 必须等于输出
+  的 `SUM(gross_gmv)`。断言约束的是输出的**形状**,而扇出不改变形状。
+- **维表"每个 key 一行"只有在有东西强制它时才成立。** 生效期配置表什么都不
+  强制:唯一性是 (key, date) 上的性质,依赖区间不重叠,而那是**数据的属性**、
+  靠人手维护,不是 schema 的属性。`dropDuplicates(key)` 不是契约,docstring
+  里的一句注释更不是。
+- **半开区间 `[from, to)` 让边界日无歧义**,是生效期 join 的默认写法;
+  `valid_to IS NULL` 表示开口,所以 `COALESCE(valid_to,'9999-12-31')` 是
+  **承重**的——裸写 `d < valid_to` 时开口行返回 NULL,谓词静默拒绝,
+  **当前在岗的 seller 全部丢失**。用闭区间 `BETWEEN` 的分歧只在"已关闭且无
+  后继"的日期上暴露(实测归给已失效的 assignment);当关闭日恰等于后继的开始
+  日时,闭区间的多匹配会被 `valid_from DESC` 的选择**抵消掉**,测试数据因此
+  看不出来。
+- **两条修法,取舍是结构性的而非 shuffle 的**(Exchange 实测 6 = 6 = 6):
+  **rank-and-pick**(让扇出发生,`row_number() partitionBy(事实键)` 再
+  `rn = 1`)一行代码、只需假设"最新的赢";**修维表**(`lead` 闭合区间,见
+  SCD2 一节)让 join **由构造保证** <=1:1,下游不需要任何去重。后者更好的理由
+  是:窗口跑在**维表**(小)而不是**事实流**(大)——实测 Sort 6 vs 4,多出来
+  的两次排的是事实流;修好的维表可复用、可独立断言;而 rank-and-pick 的守卫
+  是一句离肇事表好几个 stage 的 `WHERE rn = 1`,删掉它数字变大、**没有任何
+  其它症状**。
+- **`rn = 1` 不区分重复的来源。** 它会把上游**任何**一个 join 带来的额外行一并
+  吃掉,包括你需要的那些。Day 23 实录:为消除配置扇出而设的窗口,顺手吞掉了
+  同一订单的第二笔退款——实测 refund 40.0 vs 正确 65.0,症状是**钱变少**,
+  与它本要修的方向相反。推论:**每个 join 的右表都要单独回答"对 join key
+  唯一吗",不能指望下游某个 dedup 兜底。**
+
 ## Semi / anti join 与 IN / EXISTS (Day 9)
 - left_semi / left_anti 是**穿着 join 语法的过滤器**:输出 schema = 只有
   左表,永不发出右侧列,永不放大行数。semi = EXISTS(左行有 >=1 个匹配就
@@ -417,6 +463,16 @@
   `prev IS NULL` 前缀在 null-safe 谓词下**可以整个去掉**——
   `~(c.eqNullSafe(lag(c)) & p.eqNullSafe(lag(p)))` 在首行天然为 true。
   少一个手写守卫,就少一个守漏的机会(见 Review 启发式里的对应条)。
+
+- **`lead` 闭合区间同样适用于"修维表"**(Day 23):对一张生效期配置表按
+  `partitionBy(key).orderBy(valid_from)` 求 `lead(valid_from)`,即可把 ops
+  忘记关闭的区间补上,使 join 由构造保证 <=1:1。**但必须写
+  `LEAST(COALESCE(valid_to, OPEN), COALESCE(lead(valid_from), OPEN))`,不能用
+  裸 `lead` 直接替换 `valid_to`**——否则一个**已被正确关闭**的区间会被静默
+  延展,跨过它本不覆盖的缺口。Day 23 的数据里 S2 的 `valid_to` 与后继
+  `valid_from` 同为 2026-06-01,`LEAST` 与裸 `LEAD` 结果一致,所以那个 `LEAST`
+  是**本数据上的死代码、生产上的承重代码**——Day 15 承重-vs-死代码判据的
+  另一侧。
 
 ## Upsert / MERGE 进已有目标表 (Day 22)
 - **一条变更不会自动比它要覆盖的那一行新。** 任何针对"自带 `updated_at` 的
@@ -727,6 +783,14 @@
 - 用 `size(kv) = 2 AND kv[0] = 'tier'` 靠 AND 短路来保护下标访问是**运气,不是
   契约**:SQL 不保证 AND 的求值顺序。Catalyst 通常会短路,但**永远不要**把安全
   建立在它上面。用 try_element_at,或用一个根本不可能越界的内置函数。
+
+- **显式 cast 到目标类型与"ANSI 合规"无关**(Day 23 review 实录,纠正一个常见
+  误读):`cast('double')` 不会让任何东西变得更安全。ANSI 管的是**非法输入该抛
+  还是该返回 NULL**;把一个已经是 double 的列再 cast 成 double 是 no-op
+  (`SimplifyCasts` 直接消除,实测 optimizedPlan 里没有 Cast 节点)。ANSI 审查栏
+  的正确问题始终是"**这一步会不会抛**",不是"**类型写清楚了没有**"。一整天的
+  表达式全是 string<->string 比较时,这一栏的正确答案就是"无可标记项"——给一个
+  不存在的风险记功,和漏掉一个真实风险一样是 review 噪音。
 
 ### 字符串 cast 的目标类型是 parse 的一部分 (Day 20 实测)
 - `try_cast(s AS INT)` 与 `try_cast(try_cast(s AS DOUBLE) AS INT)` 是**两个不同
@@ -1066,6 +1130,17 @@
 **整个 Window 算子被列裁剪删掉了**,量到的是一个假计划(Exchange 显示在
 `(sku,vkey)` 上而不是 `(sku)` 上)。**测某个算子的代价时,先确认它的输出真的被
 最终结果依赖**,否则你量的是一个 Catalyst 已经删掉的东西。
+
+- **第四次确认(Day 23 实测)**:rank-and-pick 路线的窗口按 `{order_id}` 分区,
+  紧接着 `COUNT(DISTINCT)` 的重写需要
+  `hashpartitioning(order_date, region, order_id)`——`{order_id}` 是所需键的
+  子集,分区要求已满足,**不插 Exchange**(计划里
+  `HashAggregate(keys=[order_date, region, order_id], partial_sum)` 直接坐在
+  `Filter (rn = 1)` 上方);而修维表路线与 naive 版在同一位置都带一个显式
+  `Exchange hashpartitioning(order_date, region, order_id, 4)`。
+  **两条路线因此都是 6 个 Exchange,但省下的是不同的那一个**:一个用窗口的
+  shuffle 换 distinct-rewrite 的,另一个用 join 的 shuffle 换窗口的。同一个
+  总数,两条不同的路。
 
 ## 多 grain 汇总的方向性 (Day 16 实测)
 - **"上游算粗的、下游算细的"作为一条 groupBy 链是语义上不可能的**:`groupBy`
@@ -1417,3 +1492,25 @@
   而那恰是 AI 解法里唯一强于参考答案的地方。这是"多余的列几乎从来不是性能
   问题"(Day 15)的**反向兄弟条**:那条说别把冗余当性能问题,这条说**先确认
   它真的冗余**。
+- **每个 join 三问**(Day 23,用户点名收录):遇到任何 join,不看代码风格,
+  先答这三句——
+  **(1) 右表对 join key 唯一吗?** 不确定就跑
+  `df.groupBy(key).count().filter("count > 1").show()`,不要靠"看数据像是
+  唯一的"。
+  **(2) 如果不唯一,我允许扇出吗?** 有时允许——比如你就是要把一张订单展开
+  成多行明细。允许与否是**语义决定**,不是默认值。
+  **(3) 如果不允许,收敛动作在哪一步?** 说不出**具体哪一行代码**
+  (dedup / rank / 区间修复),就是没有。
+  Day 23 实录:这三问同时命中了两个 join——`seller_region` 那个做了(rank),
+  `refunds` 那个没做,而后者是用户唯一漏掉的正确性 bug。配套的诊断动作:
+  **每个 join 前后各对一次行数**——这是唯一能在数字被聚合吞掉之前抓住扇出的
+  时机。
+- **对方比你多做了一步时,默认假设是"它防的是一个我没想到的输入"**(Day 23)。
+  读到别人的代码多一个 `groupBy` / 多一个 CTE / 多一个 `isNull` 分支时,先答
+  "**这一步防的是什么**",再答"**我的代码遇到那个输入会怎样**"。Day 23 实录:
+  用户看见了 AI 的 refunds 预聚合,写下 "it can ensure the grain ... more
+  rigorous",却把它记进 **Performance 栏当成代价**,没走第二问——走了就会在
+  只读阶段发现自己少了这道防线。**code review 的一半价值是发现自己错了**;
+  "和我写的一样所以 PASS"这个理由,前提恰恰是待检验的那件事。这是 Day 19
+  "读对方代码时先独立数一遍重复表达式"的姊妹条:那条讲别只盯自己那侧多出来
+  的东西,这条讲**对方多出来的东西要先当防线读**。

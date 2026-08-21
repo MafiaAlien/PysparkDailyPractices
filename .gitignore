@@ -11,3 +11,4 @@ derby.log
 .DS_Store
 **/.DS_Store
 .venv/
+scratch/
