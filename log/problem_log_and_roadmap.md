@@ -38,6 +38,7 @@
 |-----|------|--------|-----------|--------------|----------|----------------------|
 | 22 | L4 incremental | subscription billing | Medium-Hard (5 stages) | `dim_subscription` | P1. Re-running this job on the same two inputs must produce byte-identical output. The batch is replayed whenever the scheduler retries.<br>P2. Every output row's `mrr` must come from `plan_catalog`. The `mrr` the change feed carries is advisory — upstream computes it independently and it is not the system of record.<br>P3. A subscription deleted in this batch (`op = 'D'`) must not appear in the output at all. | **一条变更不会自动比它落在的目标行新**是全题靶心:SUB2 的 `change_ts = 2026-08-17 10:00:00` 落在 `updated_at = 2026-08-17 18:30:00` 的行上,无防护应用会把订阅从 PRO **静默回滚**成 BASIC。失败形状极隐蔽:行数对、无 NULL、无重复,降级本身是正常业务事件,5 行里 4 行正确而错的那行**看不出错**;两个时间戳同为 8-17 只差几小时(其余变更全是 8-18),日期级目测抓不到。唯一读时信号是 **`updated_at` 会倒着走**(维表 last-updated 能变小 = 无防护 merge 的签名)。两条正解结构不同:**Route A 显式守卫**(`change_ts > target.updated_at`,可审计)vs **Route B 让目标行进同一排序竞争**(无 staleness 谓词,守卫**涌现**;反面是一旦 union 少了目标行或统一错了列,保护静默消失且**没有一行代码会缺**)。P1 **测试数据分辨不出 `>` 与 `>=`**(每个 key 时间戳互异),别给严格性记功;P2 忽略则 SUB3 输出 55.0 而非 100.0(feed 的 advisory 值恰好只在这一行错);P3 的墓碑必须从upsert 集与幸存目标集**两处**移除,只写 `op <> 'D'` 会删掉墓碑却留下目标行 = 订阅复活。**扰动实测(测试数据全绿)**:stale DELETE 与"同批先 D 后 I 重建"两种输入下,user-SQL 的 `NOT EXISTS (... op='D')` 抹掉整个 key,其余五份实现全部保留或重建——用户两半实现了不同语义,且**用户 SQL 才是 P3 的字面读法**,参考实现比自己的措辞宽松;plan 缺失于目录时四份解法 left join 产出 `mrr = NULL`(下游 SUM 静默吞成 0),ref 两路 inner join 整行丢弃,无一份写断言。**AI 未踩陷阱**(显式 Route A),且 P1 上**强于用户与参考答案**:五键全序 tie-break 保证平局也确定,用户两版与 ref 都只有单键。**用户 Stage-1 走 Route B 结构性免疫,但 REVIEW 未触及 trap 轴**——Correctness 栏裸 LGTM,反把 tie-break 标成"可能冗余",注意力刚好放反。PLAN(实测,AQE off):ref-B **2** Exchange / user-DSL **3**(多开一个窗口:CDC 先收敛一次、union 后再排一次,Route B 本可合并成一个)/ AI-DSL **4** / ref-A **9**(四路分叉未缓存,Scan **12** 次是真账)。`full_outer` 改 `left` 实测丢 SUB6(4 行 vs 5 行)且 **Exchange 同为 4**——零收益的正确性回归 |
 | 23 | L3 serving | e-commerce (marketplace) orders | Medium-Hard (4 stages) | `agg_region_daily` | P1. Every metric is defined once. `net_gmv` must be derived from the same `gross_gmv` and `refund_amount` expressions the output reports — no branch may recompute a metric its own way.<br>P2. Before returning, the job must assert its own output: unique on the declared grain, and `order_date` / `region` never NULL. A silent bad publish is worse than a failed job.<br>P3. Read only the columns this job actually needs from `seller_region`. The config carries operational columns that must not enter the pipeline. | **维度漂移 -> 扇出双计**是全题靶心:`S3` 两条 `valid_to = NULL` 的开区间同时覆盖 06-01 之后的任意日期,attribution join 把 S3 的事实行翻倍,`SUM` 忠实相加。失败形状**在金额之外的每一个维度上都不可见**:行数不变(5 行)、无 NULL、无重复 grain 键,且 `n_orders` **五行全对**——契约要的是 DISTINCT,`countDistinct` 对重复免疫,恰好是人类最会拿来核对行数的那一列。**P2 的三条断言在 trap 下全部通过**,作业自己的质量闸门把错数字发布出去(ref 明写:P2 只按"断言是否存在"评分,永不按"抓没抓到"评分)。放大**不是干净的倍数**:06-14 CENTRAL 组里混着未被复制的 S1 订单 O1/O8,读作 **295.0 vs 235.0(1.26x)**,"有没有哪个数正好翻倍"抓不到;唯一干净翻倍的 06-15 CENTRAL 只有一个订单,没有可比对象。读时 tell 是**同一 seller 同时有两个 `valid_to = NULL`**——一次列扫描的事,且是三个输入框里唯一违反表自身维护规则的东西;**S2 是诱饵**(两行、同 region、仓库交接,但已正确关闭),**O4 是对照行**(同为 S3 但 05-20 只落在单区间内),所以"盯住 trap seller"与"两行就是坏"两条捷径都被堵死。第二条不依赖发现 S3 的通用规则:**右表对 join key 无强制唯一性、且 join 前无 dedup/rank/区间修复 = 扇出**。**用户抓到 trap 但靠跑**(Stage 1 FAIL 报出 295.0/120.0 后反推),非靠读。**用户两处测试数据分辨不出的分歧(实测)**:(a) `refunds` 未预聚合就 join,一单两笔退款时 `rn = 1` **把第二笔退款连同那行一起淘汰**——实测 06-14 CENTRAL refund **40.0 vs 正确 65.0**,而 `gross` 不受影响,症状是"钱变少"而非"钱变多",与该窗口本要修的方向相反;(b) `between` 是**闭区间**而契约要求半开 `valid_from <= d < valid_to`,在"已关闭且无后继"的边界日实测归给已失效的 assignment(**WEST vs 正确 UNKNOWN**),本数据看不出是因为 S2 交接日 `valid_to == 后继 valid_from`,闭区间的多匹配又恰好被 `valid_from DESC` 选回后继,**两个错误互相抵消**。用户另有 **P2 完全缺失**(两版皆无断言)与 `n_orders` **DSL `cast('int')` / SQL `bigint`** 的自相矛盾(契约要 bigint,`check()` 比 Python int 故不可见)。**AI(= 参考 Route A)未踩陷阱**,`partitionBy(order_id)` 一次到位、refunds 先滚到订单粒度、半开区间显式写成 `valid_to IS NULL OR d < valid_to`;三条断言齐全但**重复键断言恒真**(对 `groupBy(a,b)` 的产物再检查 `(a,b)` 唯一),满足 P2 字面要求、检测能力为零。**用户 REVIEW_NOTES 六条里四条裸 LGTM**,唯一的实质观察("AI 在 refunds 上预聚合会多一次 shuffle")**实测推翻**:user-DSL 与 AI-DSL **Exchange 同为 6**,差别在 **Sort 5 vs 7、SortMergeJoin 2 vs 3**;更关键的是**归类错误**——预聚合是 correctness 防线不是 performance 代价,用户已写出 "ensure the grain of refund amount before joining" 却停在"更严谨",没走完"它防的是什么 / 我的代码防了吗",而走完这一步就能在只读阶段发现自己的 (a)。ANSI 栏"cast 保证了 ANSI 合规"**推理错误结论无害**(全题比较均为 string↔string,本栏正确答案是"无可标记项")。VERDICT PASS **结论对、理由不成立**("logics are as same as mine" 在阶段 ② ③ 各有一处真实分歧,且两处都是 AI 对用户错)。GAP ANALYSIS 写 "No" 亦不成立——跑没暴露任何东西,**恰恰因为测试数据无力区分**。PLAN(ref 实测,AQE off):Route A / Route B / naive **三者 Exchange 全为 6**,ref 明写 "There is no shuffle story here, and none should be invented";真实差别是 **Sort 6 vs 4** 以及**排的是 fact 流还是 dim 流**(Route A 的 `Sort [order_id, valid_from DESC, region]` 在事实流上,Route B 的 `Sort [seller_id, valid_from]` 在 6 行维表上)。Route A 靠 `{order_id} ⊆ {order_date,region,order_id}` 白拿 distinct-rewrite 的 Exchange,Route B 靠 join 与 window 同为 `seller_id` 白拿窗口的 Exchange——**分区键子集规则第四次确认**(Day 16/17/18) |
+| 24 | L2 detail modeling | logistics — cold-chain warehouse telemetry | Medium-Hard (4 stages) | `fct_device_hour` | P1. Every reading is attributed to the hour of its own `reading_ts`. `ingest_ts` records when the collector received the message and must never determine which hour a reading falls in.<br>P2. Before returning, the job must assert its own output: exactly one row per (device_id, reading_hour), and no NULL in `device_id` / `reading_hour` / `site_id`. A silent bad publish is worse than a failed job.<br>P3. Read only the columns this job needs from the two config tables. `model` and `ticket_id` are operational metadata and must not enter the pipeline. | **重传是一次新的传输**是全题靶心:landing 表 at-least-once,网关在**传输时刻**盖 `event_id`、collector 在**落库时刻**盖 `ingest_ts`,于是 E07 是 E02 的重发却带着全新的信封。能存活重传的身份只有载荷的业务键 `(device_id, reading_ts)`;按 `event_id` 或按整行去重都收不拢,且**必须收在入口**。失败形状是全项目最窄的一次:**整个输出只有一个整数格移动**(D1/09:00 的 `n_readings` 3 而非 2)。grain 由最后的 `groupBy` 构造性保证唯一、无 NULL、`avg` 与 `max` **双双不变**(D1 两条幸存读数都是 22.0,`mean{22,22} = mean{22,22,22}`)——AVG 只在被复制的值偏离组均值时才敏感,这份数据恰好不偏离。3 是一个合理的小时读数数量,输出里**没有任何形状信号**。诱饵是 E06/E06 的逐字节重复对:它被**每一条**去重路线抓到,包括两条错的,于是"重复已处理"这个错觉拿到了可见证据。读时 tell 两条,都只需一次列扫描:(1) 扫 `(device_id, reading_ts)` 找重复,E02/E07 在它上面撞车而信封每一列都不同;(2) E07 是全表**唯一** `ingest_ts` 落在比 `reading_ts` 更晚一个小时的行(09:20 测、10:18 到,58 分钟 vs 其余行 13-17 分钟),P1 正好把读者指向这对列。**AI 未踩陷阱但键选错了一档**:`select(device_id, reading_ts, temp_c).distinct()` 先投影掉信封再整行去重,同时收掉 E06 与 E07——但键里含**度量列**,比 ref Route B 还弱一档:Route B 在同键冲突时任意留一行,AI 的写法**两行都留**,一条订正重发(同 device 同 ts、`temp_c` 已修正)会整个漏过去,`n_readings = 2` 且 `avg` 是两者均值。**用户靠跑抓到 trap,非靠读**(Stage 1 首次 FAIL 报 3/2 后反推),连续第二天重演 Day 23 的同一形状。**用户 Stage 1 的真实缺陷是确定性而非正确性**:`row_number() OVER (PARTITION BY device_id, reading_ts ORDER BY reading_ts ASC)`——**`ORDER BY` 排的就是 partition key**,分区内恒定、全行平局,于是写出了 Route A 的语法、拿到的是 Route B 的保证(任意幸存者 + 重跑不幂等),而 ref 明写 Route A 是三种去重强度里"唯一能说明哪一份副本获胜"的那种。**P2 用户只做了一半**(有 NULL 断言、无 grain 唯一性断言,自己在 notes 里承认);AI 两条齐全。但 ref 实测给了更狠的判断:**完整的 P2 也看不见入口重复**——最后的 `groupBy` 让 grain 构造性唯一,唯一性断言在结构上不可能观察到已被折叠的重复,naive 路线三条断言全过。两侧暴露面**镜像**:用户 registry join 在聚合**后**,registry 若出现同 device 两行 -> 扇出 -> **grain 破坏** -> 恰好缺的就是那条断言;AI join 在聚合**前**,同样输入 -> `n_readings` 翻倍 -> grain 仍唯一、断言全绿。**P3 用户 DSL 违反、SQL 满足**(SQL 的 `fill_null_decommissioned_on` CTE 显式选四列,DSL 全表进 join),同一作业两个分支两种卫生标准;AI 两侧均满足。**但 P3 的症状实测为零**(见 log/04 列裁剪一条),归类应为 production robustness(两分支不一致),不是 performance。用户另有 `n_readings` **`cast('int')` 而契约要 bigint**——与 Day 23 完全相同的偏离,`check()` 比 Python int 故永远绿,**连续第二天**。**用户 REVIEW_NOTES 六行没有一行提到去重步骤**——刚被这一步烧过、AI 在同一步用了不同的键,这是当天最该被审的一级;Correctness 栏的实质观察("AI 聚合后 inner join registry 会不会扇出")方向正确但没走完,答案是 registry 被**声明**为一行一设备、而**没有任何代码强制这个声明**,那正是他自己跳过的断言的职责。Production 栏"site_id 作为 join key 不符合 P2"**两处皆错**:`site_id` 是 `groupBy` 里的函数依赖列不是 join 键,且与 P2(断言约束)无关;同栏"I bypass row count reconciliation"是准确自评。ANSI 栏**结论对理由错**(答"因为 inner join 不产 NULL",正确理由是"全程 string↔string、无 cast/除法/下标",ref 标准答案"无可标记项")。VERDICT PASS 结论对,理由"logic same as mine, differ at groupby step"**绕过了唯一要紧的那一级**——分歧在入口去重,不在 groupBy。PLAN(实测,AQE off,shuffle.partitions=4):**用户 DSL 4 / 用户 SQL 3 / AI DSL 4 / AI SQL 3** Exchange。`left_anti` 与 `NOT EXISTS` 的 Exchange 差在**两份独立编写的实现上同时复现**,SQL 侧把 feed 按 `device_id` **单键** shuffle 一次同时喂窗口与 join(`HashPartitioning(device_id)` 满足 `Window` 的 `ClusteredDistribution(device_id, reading_ts)`)——**分区键子集规则第六次确认**(Day 16/17/18/23)。AI DSL 的节点数与 ref Route B DSL **完全吻合**(Exch 4 / Sort 3 / Window 0 / HashAgg 4 / SMJ 2),`distinct` 与 `dropDuplicates` 同样计划成 partial+final 聚合;用户 DSL 是 4/6/1/2/2。用户与 AI 的真实差别**不是 shuffle 数**(都是 4),是 `Window` + `Sort` 换两个 `HashAggregate`。AI 的 `distinct` shuffle 键**宽一列**(`device_id, reading_ts, temp_c`),是"把 `temp_c` 放进去重键"这个设计选择的物理回声 |
 
 ## 调度矩阵(已用组合)
 
@@ -48,6 +49,7 @@
 |-----|-----------|--------|--------------|
 | 22 | L4 incremental | subscription billing | late data |
 | 23 | L3 serving | e-commerce (marketplace) orders | fan-out double counting |
+| 24 | L2 detail modeling | logistics — cold-chain warehouse telemetry | replay |
 
 ## Supplemental drills completed
 - Pivot mini-drills x5 (script form, no class): explicit values list,
@@ -79,21 +81,40 @@
   **但 trap 仍是靠跑抓到的,不是靠读**——读时 tell(同一 seller 同时有两个
   `valid_to = NULL`)在 Stage 1 全程未被触发。
 
-### NEXT(Day 24)
-- **Day 24 — L2 cleansing / IoT telemetry / failure mode: duplicate replay。
-  4 stages -> Medium-Hard。** 原始设备遥测落地前的清洗层:同一条读数被网关
-  重发,去重必须发生在**入口**而不是靠下游聚合兜底。选它的三条理由:
-  (1) 三轴与 Day 22、Day 23 **全部不重叠**(L4/L3 -> L2、
-  billing/marketplace -> IoT、late data/fan-out -> duplicate replay);
-  (2) 与 Day 23 的**关键区别必须在题面里成立**:Day 23 的重复由 **join
-  制造**,Day 24 的重复**来自数据源本身**,收敛点从"join 的右侧"移到
-  "读入之后的第一步",两者的检查动作不同——这正是 Day 23 教训的下一格;
-  (3) 所需 primitive 全部已练过(`row_number` 去重、replay counting、
-  `dropDuplicates` 不是契约、`COUNT(*)` vs `COUNT(col)`、
-  conditional aggregation),**Stage 1 不需要现学任何函数**。
+### DONE(Day 24)
+- Day 24 已完成:L2 detail modeling / cold-chain telemetry / replay,
+  4 stages Medium-Hard。三条选型理由**全部兑现**:三轴与 Day 22、Day 23 零重叠;
+  重复确实来自**数据源本身**而非 join 制造,收敛点成功从"join 右侧"移到
+  "读入之后的第一步";Stage 1 未出现任何现学 API 的情况。
+- **但 trap 连续第二天靠跑抓到,不是靠读。** Day 23 的读时 tell(同一 seller
+  同时有两个 `valid_to = NULL`)当时未触发,Day 24 的两条 tell
+  (`(device_id, reading_ts)` 撞车、E07 的 `ingest_ts` 跨小时滞后)同样未触发。
+  **这已经是一个稳定模式,不是偶发。**
+- **更值得记的是 REVIEW 侧连续三天的同形失效**:Day 22"REVIEW 未触及 trap 轴"、
+  Day 23"六条里四条裸 LGTM"、Day 24"六行没有一行提到去重步骤"。三天的共同形状是
+  **审查注意力锚在自己 Stage 1 挣扎过的地方,而不是锚在管线阶段上**——Day 24
+  尤其刺眼:用户当天刚在入口去重上 FAIL 过一次,而 AI 恰好在同一级用了不同的键,
+  那一行仍然没有被写下来。
+- **连续第二天的 `cast('int')` vs 契约 `bigint`**(Day 23 同款),`check()` 比的是
+  Python int 故永远看不见。这条已经不是"发现",是**习惯**。
+
+### NEXT(Day 25)
+- **Day 25 — L3 aggregation / ad delivery / failure mode: timezone attribution。
+  5 stages -> Medium-Hard。** 广告投放事件按**投放地本地日**归集,而落地表是 UTC。
+  选它的三条理由:(1) 三轴与 Day 22/23/24 **全部不重叠**(L4 / L3 serving / L2
+  -> L3 aggregation、billing / marketplace / logistics -> ad delivery、
+  late data / fan-out / replay -> timezone attribution);(2) Day 24 **刻意回避了
+  日期解析**(定宽字符串,题面明写 "about the pipeline, not date parsing"),把时区
+  归属放在下一格是自然升级,且复用 Day 11 的 UTC->local 分桶而不是重学它;
+  (3) 所需 primitive 全部已练过(UTC->local bucketing、event-date attribution、
+  date-dimension spine gap-fill、conditional aggregation),**Stage 1 不需要现学
+  任何函数**。
+- **本日的额外设计要求(针对上面记录的连续失效)**:trap 的读时 tell 必须落在
+  **题面已经明确要求读者比对的两列**上,而不是落在一个需要主动扫描才能发现的
+  数据巧合上。Day 23 与 Day 24 的 tell 都属于后者,连续两次未被触发。
+- 若要把难度推到 Hard(6 stages),加一级 date-dimension spine 补齐即可;
+  但**不建议同时**——本日的失败模式本身已是三轴里最容易被"看起来对"掩盖的一个。
 - 后续候选(尚未排期):
-  L3 aggregation / ad delivery / **timezone attribution**(复用 Day 11
-  的 UTC->local 但把它放进多阶段管道);
   L4 incremental / inventory / **orphan keys**(层级与 Day 22 相同,
   业务域与失败模式已同时换,允许)——但注意 Day 23 的 ref 已把
   "effective-dated join 的孤儿是 fact-side key,`left_anti` 找不到同一批
@@ -182,6 +203,11 @@ Easy/Medium/Medium-Hard 的交替节奏。
   "没有行"。`left_anti` on `seller_id` 与 join 后 `region IS NULL` **识别的
   不是同一批订单**(S4 有配置行,只是不覆盖六月),Day 9 的 anti-join idiom
   在 effective-dated join 上不成立
+  <- **Day 24 对照**:排除类 anti-join 的**平凡正确**形态。与 Day 23 的
+  effective-dated 情形相反,这里"设备有几张维护单"与"该读数是否落在某张单的
+  区间内"是两个问题,`left_anti` / `NOT EXISTS` 由构造保证不扇出,而
+  `left join` + `IS NULL` 只在右表对 join key 唯一时等价——一台设备可以有
+  任意多张工单,`MT-103`(D4,无读数)就是专门用来打死 inner-join 写法的对照行
 
 ## Difficulty cadence
 Alternate roughly Easy/Medium -> Medium -> Medium-Hard; insert an Easy
