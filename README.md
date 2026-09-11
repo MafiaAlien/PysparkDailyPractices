@@ -185,10 +185,13 @@ dates pins `spark.sql.session.timeZone`.
 docstring at the top of `days/dayNN_*.py` and stop there. The reference file
 names the trap in its second section.
 
-**The logs are in Chinese.** `log/key_takeaways.md` and
-`log/problem_log_and_roadmap.md` are working notes written in Chinese prose with
-English API names, error classes, and SQL keywords. Everything inside the day
-files — code, comments, docstrings, identifiers — is English.
+**Some of it is in Chinese.** `log/key_takeaways.md` and
+`log/problem_log_and_roadmap.md` are working notes in Chinese prose with English
+API names, error classes, and SQL keywords; so is the design doc under `docs/`.
+Day files from Day 17 on are English throughout — code, comments, docstrings,
+identifiers. A handful of early ones (Day 2, 3, 4, 12) still carry Chinese
+explanatory comments from before that rule existed, as do the `Gemini_*` files,
+which are ad-hoc practice scripts predating the daily workflow.
 
 **This is not a library or a tutorial.** There is nothing to import. It is a
 personal training record, public as a record of the work.
