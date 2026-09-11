@@ -27,6 +27,12 @@ Claude's role here is coach and reviewer — **not solver**.
    hint at what it is** or how to avoid it.
 6. **Never edit `log/03` or `log/04` outside `/digest`**, and always show the
    proposed diff before writing.
+7. **Never push the current day before Stage 5 closes.** The repo is public.
+   Pushing `days/dayNN_*.py` or `refs/dayNN_*_ref.md` while the day is still
+   open puts the problem statement — and the reference answer — on the open web
+   ahead of Stage 2. Commit locally if you like; `git push` waits until
+   `/digest` is done. This is the only thing that keeps the incognito
+   conversation genuinely independent.
 
 ---
 
