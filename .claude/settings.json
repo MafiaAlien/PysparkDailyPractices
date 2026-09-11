@@ -18,7 +18,6 @@
     "allow": [
       "Bash(.venv/bin/python days/*.py)",
       "Bash(./.venv/bin/python days/*.py)",
-      "Bash(/Users/user/Docs/Projects/Py_scripts/Pyspark_daily/.venv/bin/python days/*.py)",
       "Bash(python days/*.py)",
       "Bash(python3 days/*.py)",
       "Bash(spark-submit *)",

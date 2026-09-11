@@ -40,7 +40,7 @@
 **Verification approach.** This repo has no test framework. Task 1 is verified by building a throwaway filled-in day from the new template in the scratchpad and actually running it — that is the only task with executable behavior. Every other task is a Markdown edit verified by `grep`, by reading the diff, and (Tasks 3–7) by a consistency check against the spec.
 
 Scratchpad root for all throwaway files:
-`/private/tmp/claude/-Users-user-Docs-Projects-Py-scripts-Pyspark-daily/8e6fc149-ccdb-4c4f-9286-ea7732721101/scratchpad`
+`<scratchpad>`
 
 ---
 
@@ -140,7 +140,7 @@ if __name__ == "__main__":
 - [ ] **Step 2: Run the smoke test to confirm the ordering is sound**
 
 ```bash
-.venv/bin/python "/private/tmp/claude/-Users-user-Docs-Projects-Py-scripts-Pyspark-daily/8e6fc149-ccdb-4c4f-9286-ea7732721101/scratchpad/smoke_etl_day.py"
+.venv/bin/python "<scratchpad>/smoke_etl_day.py"
 ```
 
 Expected: four lines, all `[PASS]` — `DSL`, `SQL`, `AI-DSL`, `AI-SQL`. If any line says `NameError`, the block ordering is wrong and the template must not be written until it passes.
@@ -1065,7 +1065,7 @@ not."
 - [ ] **Step 1: Build a throwaway Day-22-shaped file from the real template**
 
 ```bash
-cp templates/template_etl.py "/private/tmp/claude/-Users-user-Docs-Projects-Py-scripts-Pyspark-daily/8e6fc149-ccdb-4c4f-9286-ea7732721101/scratchpad/day22_dryrun.py"
+cp templates/template_etl.py "<scratchpad>/day22_dryrun.py"
 ```
 
 Then edit that copy exactly as `/newday` step 4 prescribes: rename `table_a` → `orders`, `table_b` → `stores`, `build_output_table_dsl` → `build_store_revenue_dsl`, `build_output_table_sql` → `build_store_revenue_sql`; update both `createOrReplaceTempView` calls, both `check(...)` calls, and both commented Stage-4 lines. Implement both functions as a trivial join-and-sum, paste a trivial `ai_` pair between the paste markers, fill three `orders` rows and two `stores` rows, hand-derive `expected`, and uncomment the two Stage-4 lines.
@@ -1073,7 +1073,7 @@ Then edit that copy exactly as `/newday` step 4 prescribes: rename `table_a` →
 - [ ] **Step 2: Run it**
 
 ```bash
-.venv/bin/python "/private/tmp/claude/-Users-user-Docs-Projects-Py-scripts-Pyspark-daily/8e6fc149-ccdb-4c4f-9286-ea7732721101/scratchpad/day22_dryrun.py"
+.venv/bin/python "<scratchpad>/day22_dryrun.py"
 ```
 
 Expected: four lines, all `[PASS]` — `DSL`, `SQL`, `AI-DSL (post-review verification)`, `AI-SQL (post-review verification)`. A `NameError` on either AI line means the paste zone drifted back below `__main__`; a `FAIL` means the rename missed a call site.

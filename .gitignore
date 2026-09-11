@@ -1,14 +1,31 @@
+# --- OS / editor ---
+.DS_Store
+**/.DS_Store
+.idea/
+*.swp
 
-.databricks
-.claude/settings.local.json
+# --- Python / venv ---
+.venv/
 __pycache__/
 *.pyc
+
+# --- Spark local state ---
 spark-warehouse/
 metastore_db/
 derby.log
-.DS_Store
-**/.DS_Store
-.DS_Store
-**/.DS_Store
-.venv/
+*.log
+
+# --- secrets / local config (never commit) ---
+.env
+.env.*
+*.pem
+*.key
+.netrc
+.claude/settings.local.json
+.databricks/
+databricks.yml
+
+# --- local scratch / generated ---
 scratch/
+artifacts/
+.superpowers/
