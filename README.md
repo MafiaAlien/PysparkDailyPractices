@@ -17,6 +17,37 @@ before the failure finds you.
 
 ---
 
+## Status
+
+<!-- STATUS:BEGIN — updated by /digest at the close of Stage 5 -->
+
+**Last completed: Day 24** — L2 detail modeling · logistics (cold-chain
+warehouse telemetry) · **Medium-Hard**, 4 stages · output `fct_device_hour`
+
+23 days done (Day 1–24; Day 21 was never generated — the ETL-scenario switch
+landed first). Mode since Day 22: one full production pipeline per day.
+
+| Day | Layer | Domain | Difficulty | Output | Failure mode |
+|-----|-------|--------|-----------|--------|--------------|
+| 24 | L2 detail modeling | logistics — cold-chain telemetry | Medium-Hard (4 stages) | `fct_device_hour` | replay |
+| 23 | L3 serving | e-commerce marketplace orders | Medium-Hard (4 stages) | `agg_region_daily` | fan-out double counting |
+| 22 | L4 incremental | subscription billing | Medium-Hard (5 stages) | `dim_subscription` | late data |
+
+Days 1–21 were single-technique days — windows, gaps-and-islands, pivots,
+map/struct columns, semi-anti joins, GROUPING SETS, timezone bucketing,
+sessionization, UDF cost, window frames, NULL semantics, SCD2, skew salting,
+higher-order array functions, ANSI mode. The full table, with difficulty and
+the trap for each, is in [`log/problem_log_and_roadmap.md`](log/problem_log_and_roadmap.md).
+
+> The status above intentionally lags: a day appears here only after Stage 5
+> closes. Publishing an open day's topic would put it on the web ahead of the
+> Stage-2 incognito conversation, which is exactly what that stage exists to
+> avoid.
+
+<!-- STATUS:END -->
+
+---
+
 ## Why it is built this way
 
 The obvious way to practice with an AI assistant is to ask it for the answer.

@@ -16,7 +16,7 @@ python days/dayNN_*.py     自己跑，直到 DSL 和 SQL 都 PASS
 （读代码，填 REVIEW_NOTES，写 VERDICT —— 运行之前必须先下结论）
                            ↓
 /review NN                 Claude 也先盲审 → 实跑 → 三方对比 → 批改你的 review
-/digest NN                 更新 log/03 和 log/04（唯一会写 log 的命令）
+/digest NN                 更新 log/03、log/04 和 README 的 status 区块
                            ↓
 git diff log/key_takeaways.md    ★ 十秒钟，只看新增行
 git add -A && git commit -m "day NN: <topic>"
@@ -34,7 +34,7 @@ git add -A && git commit -m "day NN: <topic>"
 | `/newday [主题]` | — | 读 log/03 定选题，**先提议再生成**；产出 `days/dayNN_*.py` + `_ref.md` | 是（确认后） |
 | `/genprompt NN` | 2 | 只读题面 docstring，输出 incognito prompt。**绝不在本仓库解题** | 否 |
 | `/review NN` | 5 | 先盲审 → 实跑 → 读 `_ref.md` → 三方对比 → 逐条批改你的 REVIEW_NOTES | 否 |
-| `/digest NN` | 5 | 增量更新 log/03 和 log/04，**先给预览再写** | 是（批准后） |
+| `/digest NN` | 5 | 增量更新 log/03、log/04，并刷新 README 的 `STATUS:BEGIN/END` 区块，**先给预览再写** | 是（批准后） |
 
 `/newday` 后面可以跟主题覆盖默认排期：`/newday skew handling`。
 

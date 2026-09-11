@@ -49,7 +49,17 @@ Run after `/review`. This is the **only** command permitted to write into
 4. Wait for approval, then apply with targeted edits — not a full-file
    rewrite. `log/04` is long; a rewrite risks silent loss.
 
-5. Finish with a one-line proposal for the next day's topic and reflect it in
+5. **Update the README status block.** Between the `STATUS:BEGIN` /
+   `STATUS:END` markers in `README.md`: bump "Last completed" to this day,
+   bump the day count, and prepend a row to the ETL table (Day, layer, domain,
+   difficulty with stage count, output table, failure mode). Take every value
+   from the `log/03` row you just wrote — do not restate it from memory. Never
+   list a day here before its Stage 5 has closed; the block is public and a
+   day's topic must not precede its own Stage 2 onto the web (HARD RULE 7).
+   The trap belongs in `log/03` and `refs/` only — the README table's last
+   column is the **failure-mode axis label**, not the trap.
+
+6. Finish with a one-line proposal for the next day's topic and reflect it in
    "Scheduled next" — `/newday` reads that line first and shapes it onto the
    three axes, so it is the handoff, not a note to self. For an ETL scenario
    day, difficulty is the **pipeline stage count** (3 = Medium, 4–5 =
