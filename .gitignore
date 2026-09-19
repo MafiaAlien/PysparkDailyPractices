@@ -3,6 +3,7 @@
 **/.DS_Store
 .idea/
 *.swp
+.vscode/
 
 # --- Python / venv ---
 .venv/

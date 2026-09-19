@@ -100,6 +100,15 @@
   **都为真**,它不是抓不到,是**不可能抓到**。实测:naive 路线三条断言全过、
   错数字照发,**连续第二天质量闸门放行了错数字**。P2 类约束只能按"断言是否存在"
   评分,永不按"抓到没抓到"评分。
+- **第三级,规则的最终形态**(Day 25,连续第三天 23/24/25):Day 23 是"扇出不改变
+  输出形状",Day 24 是"grain 唯一是构造性的",Day 25 的错解**丢行**——被错误谓词
+  过滤掉的事件在输出里不留任何痕迹,两条断言仍全绿。合成一条通用规则:
+  **断言只能观察活着进入输出的东西,永远看不见半路被丢掉的东西。**
+  这条规则同时判死三种形状断言(唯一性 / 非 NULL / 行数)对**入口级** bug 的
+  检测能力,无论 bug 是复制行、丢行还是错分组。
+  **真正另一类的检查是对账式 / 输入守恒式断言**:例如"join 之前在事实表上按
+  `market_code` 算的 in-scope 计数,必须等于输出 `SUM(n_impressions + n_clicks)`"。
+  跨 Day 23/24/25 的六份实现(用户 ×2 / AI ×2 / ref ×2 每日)**无一人写过**。
 
 ## 窗口 shuffle 机制(属于 spec,不属于函数)
 - shuffle 属于 window **SPEC**,不属于函数:row_number / rank / lag /
@@ -425,7 +434,7 @@
   写反的原因)。grouping(col)=1 形式自解释;grouping_id 的魔数需要把位序钉死在
   **参数顺序**上来回忆。
 
-## 日期/时间: 时区分桶 + 日期维度补齐 (Day 11)
+## 日期/时间: 时区分桶 + 日期维度补齐 (Day 11, Day 25 扩充)
 - **转换方向就是全部陷阱**。from_utc_timestamp(ts, tz) 读作"ts 是一个 UTC 瞬时,
   给我它在 tz 的墙钟时间"——这正是"以 UTC 存储、按本地报表"要的方向。
   to_utc_timestamp 是**反向**(本地->UTC),会朝错误方向平移:一笔 LA 的销售会
@@ -452,6 +461,28 @@
   double),n_txn -> CAST(0 AS BIGINT) 以匹配 COUNT 的 bigint。revenue 上的 double
   cast 是冗余的(int 字面量 0 在与 double 的 coalesce 中会提升);n_txn 上的 bigint
   cast 才是真正有用的那个。冗余 cast vs 必要 cast,同样遵循"逐个判别、别一刀切"。
+- **本地日历日 = 一个半开 UTC 区间**(Day 25):`[local 00:00, local+1d 00:00)`,
+  而它的**宽度**只有在区间内没有 DST 跳变时才是 24h。推论:把一个本地日过滤
+  **下推**到 UTC 轴上(为了跳 UTC 分区,真实作业的常见动机)必须写
+  `to_utc_timestamp(concat(flight_end_date + 1 day, ' 00:00:00'), tz)` 配**严格 `<`**
+  ——**闭区间的本地 `<=` 末端没有闭区间的 UTC 等价物**。两处独立的错法:`<=` 放进
+  这个上界会多收一个恰在次日本地午夜的事件;把上界写成
+  `to_utc_timestamp(flight_end_date 00:00)` 会**静默丢掉整个 flight 末日**。
+  这条路线还有一个结构性代价:它要求 `market_config` join 进**维表**而不只是
+  事实流——**窗口不是常量,是一个 per-market 的值**,这正是"把 filter 下推"这类
+  重构容易漏的地方。与 Day 17 / Day 23 的半开区间闭合同源,区别是这里的边界是
+  **生成**的而不是存储的。
+- **一个日期是"相对某口钟的标签",不是一个时间点**(Day 25):UTC 日期与本地日期
+  在每 24 小时里有 `24 - |offset|` 小时是**重合**的,所以这一族归属 bug 天然
+  70–90% 巧合正确,看起来永远像一次运气不好的舍入而不是系统性错误。
+  **推论(本日实录的失败形状)**:跨本地午夜的行**在输出里显眼地正确**,足以给出
+  "时区换算是好的"的可见证据,而真正出事的行是"UTC 日期 ≠ 本地日期**且**
+  某个边界正好夹在两者之间"的那一行——这两批行**不是同一批**。
+- **字符串时间戳与字符串时间戳可比,与字符串日期不可比**(Day 25):
+  `'2026-09-10 10:00:00' <= '2026-09-10'` 是 **false**(短串更小)。定宽只在
+  **同一格式内**买到"词序 = 时序",跨格式就静默失效,而这恰好发生在"事实表存
+  `yyyy-MM-dd HH:mm:ss`、配置表存 `yyyy-MM-dd`"这个极常见的布置上。
+  与 Day 20 的字符串族同源(那边是 parse 路径,这边是跨格式比较)。
 
 ## 会话化与窗口 frame (Day 13)
 - **按间隔阈值做会话切分 = 把 gaps-and-islands 的"严格 +1"换成"阈值"**。
@@ -1001,6 +1032,29 @@
   (这同时修正 `refs/day24_device_hour_ref.md` 的 P3 审计表——它称未满足时
   `model` / `ticket_id` 会"骑着两次 shuffle 过去",实测非 Scan 节点出现次数为 0。
   以本条为准。)
+  **(Day 25 第二次确认,不同数据不同作业:**用户两版整表进 join、AI 显式 `.select`,
+  `.explain()` 里配置表之上同样是 `Project [placement_id, market_code]` /
+  `Project [market_code, tz_name]`,`channel` / `reporting_currency` 被剪掉。
+  这类"P3 未投影"发现的严重度定档**至此不再是本日判断,是标准做法**:
+  production robustness(按两分支是否一致),不是 performance。**)**
+- **broadcast hint 买的是"保证",不是"提速"——而省下的那次 shuffle 可能在另一头
+  又付回去**(Day 25 实测,`shuffle.partitions=4`):同一份作业两条写法,
+  **用户(无 hint)6 个 shuffle Exchange / 3 SortMergeJoin / 0 BroadcastHashJoin**,
+  **AI(三处 `F.broadcast`)1 个 shuffle Exchange + 3 BroadcastExchange /
+  3 BroadcastHashJoin / 0 SMJ**。"AI 的 broadcast 更好"这个结论成立,但形状**不是**
+  单调的 6 对 1:
+  **用户的 partial / final `HashAggregate` 之间没有 Exchange**——stage 3 的 SMJ 已按
+  `(campaign_id, market_code)` 做了 hash 分区,而它是 groupBy 键
+  `(campaign_id, market_code, local_date)` 的**子集**,满足聚合的分布要求;
+  AI 的全广播路线让所有 join 都不 shuffle,于是**最终聚合那一次 shuffle 必须自己付**。
+  真实对比是 **"3 次 join shuffle + 0 次聚合 shuffle" vs "0 次 join shuffle +
+  1 次聚合 shuffle"**。**分区键子集规则第七次确认**(Day 16/17/18/23/24),
+  这次的新形态是它**作用在 join 与聚合之间**,而不是 join 与窗口之间。
+  **限定(必须一起记,否则这条会被误用)**:三张配置表(4 / 3 / 4 行)远低于
+  `autoBroadcastJoinThreshold`,用户侧读到的计划是 `isFinalPlan=false`,
+  **AQE 最终态未观测**——运行时很可能同样转成 BroadcastHashJoin。所以 hint 的价值
+  是**把行为钉进计划、不依赖统计信息可用**,不能据此说 AI 跑得更快。
+  与 Day 16"性能结论必须声明它成立的条件"同源。
 
 ## API 风格约定
 - 纯列引用(select/groupBy/on)-> 用普通字符串;当列参与表达式(比较、算术、
@@ -1605,3 +1659,42 @@
   且**必须**是载荷的最小标识子集。配套动作:
   `df.groupBy(候选键).count().filter("count > 1").show()`——与 Day 23"每个 join
   三问"的第 (1) 问是同一个动作,只是换到了去重上。
+- **对 DataFrame 做存在性/真值判断的断言,恒真且从不执行**(Day 25):看到任何
+  `assert` / `if ... raise` 形式的质量闸门,**第一件事是找它的求值动作**——
+  `.count()` / `.collect()` / `.first()` / `.isEmpty()`。断言的对象如果是一个
+  **DataFrame 对象**而不是一个 Python 数值,这条闸门**恒为真、连一个 job 都不提交、
+  永远不保护任何东西**。Day 25 实录:用户两版都写了
+  `assert (agg.groupBy(...).filter("dup_cnt > 1") is not None)`,而同一函数里的
+  NULL 断言带了 `.count()` 所以是真的——**不是不懂,是这一条漏了收尾**,
+  且用户在 notes 里判"quality assertions are correct here"。
+  严重度 **production robustness**,不是 style:一道**声称存在而实际不存在**的闸门
+  比没有闸门更危险,因为 review 时会被当成已覆盖。
+  (顺带:`if df:` 这种写法会直接抛 `CANNOT_CONVERT_COLUMN_INTO_BOOL` 从而暴露自己,
+  `is not None` 恰恰是**不会报错**的那个写法,所以它能活到生产。)
+- **时区/日历作业:先把"提到日期的地方"列全,再逐个问它读的是哪一列**(Day 25):
+  一个作业里出现时区换算时,**不要问"换算做了吗"**——grain 列逼着它做,所以一定做了,
+  而且它会在输出里显眼地正确。要问:**契约假定的那口钟,在每一个提到日期的地方
+  都换过了吗?** 把 filter 谓词、join key、window 边界、`between` 的两端逐个点名,
+  看它读的是原始时间列还是换算后的列。**这是一个类型错误,而类型系统看不见它**
+  (两边都是 string / 都是 date)。落地形态:本日的审查问题可以压缩成一句
+  **"scope 谓词读的是哪一列?"**,答案是 `event_ts_utc` 就错,是 `local_date` 就对。
+  **本条的真正教训不在时区上**:这条规则以"时区陷阱的第二层"的措辞**早在 Day 11
+  就写进 log/04 了**,Day 25 的 trap 与它一字不差。躺在 log/04 里的要点不会自己
+  变成 checklist——**审查前按当日的管线阶段去 log/04 里取对应那条**,是一个必须
+  显式做的动作。
+- **"和对方逻辑一样,所以 PASS"是一个不成立的推理形式**(Day 25;Day 23 同族条目
+  的升级,已连续四天出现):Day 23 记的是"这个理由的前提恰恰是待检验的那件事",
+  Day 25 把它推到极端——用户 Correctness 栏的全部内容是"我和 AI 逻辑几乎一样",
+  而当天的 trap 恰好在双方都写对的那一级。**结论对了,但方法在双方一起错时会一起
+  PASS**,而"独立生成的两份解法一起错"正是 trap 被设计来做到的事(Day 25 的 ref
+  明写:错解只动两个数字、行数不变、无 NULL)。**落地替代动作:不拿自己的代码作
+  基准,拿题面的契约条款作基准**——A1/A2/A3 与 P1/P2/P3 逐条对照双方,每条各写一行。
+  同构性只能用来**定位差异**,不能用来**判定正确**。
+- **输出列的类型是契约的一部分,而按值比较的测试看不见它**(Day 25,连续第三天
+  23/24/25):契约写 `bigint` 而代码写 `cast('int')`,`check()` 比的是 Python int
+  所以永远绿。Day 25 更严重一档:**同一个指标在自己的 DSL 与 SQL 两条分支里是
+  两种类型**(DSL `int` / SQL `BIGINT`)——这落进 "one metric computed two ways"
+  的定义,归 **production robustness**,不是 style。落地动作:**契约声明了类型的
+  日子,收尾时打一次 `df.schema.simpleString()` 和契约逐列对**,一次列扫描的事;
+  按位置比较的 `check()` 对类型、按值比较的 `check()` 对顺序,**两者都不对类型**。
+  与既有的"输出列顺序是静默契约变更"那条并列:那条管顺序,这条管类型。
