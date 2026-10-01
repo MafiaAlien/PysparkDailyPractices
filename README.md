@@ -21,14 +21,15 @@ before the failure finds you.
 
 <!-- STATUS:BEGIN — updated by /digest at the close of Stage 5 -->
 
-**Last completed: Day 25** — L3 serving (aggregation) · ad delivery ·
-**Medium-Hard**, 5 stages · output `agg_campaign_market_daily`
+**Last completed: Day 26** — L1 staging / cleansing · inventory replenishment ·
+**Medium-Hard**, 4 stages · output `stg_replenishment_request`
 
-24 days done (Day 1–25; Day 21 was never generated — the ETL-scenario switch
+25 days done (Day 1–26; Day 21 was never generated — the ETL-scenario switch
 landed first). Mode since Day 22: one full production pipeline per day.
 
 | Day | Layer | Domain | Difficulty | Output | Failure mode |
 |-----|-------|--------|-----------|--------|--------------|
+| 26 | L1 staging / cleansing | inventory replenishment | Medium-Hard (4 stages) | `stg_replenishment_request` | nullable key |
 | 25 | L3 serving (aggregation) | ad delivery | Medium-Hard (5 stages) | `agg_campaign_market_daily` | timezone attribution |
 | 24 | L2 detail modeling | logistics — cold-chain telemetry | Medium-Hard (4 stages) | `fct_device_hour` | replay |
 | 23 | L3 serving | e-commerce marketplace orders | Medium-Hard (4 stages) | `agg_region_daily` | fan-out double counting |

@@ -109,6 +109,16 @@
   **真正另一类的检查是对账式 / 输入守恒式断言**:例如"join 之前在事实表上按
   `market_code` 算的 in-scope 计数,必须等于输出 `SUM(n_impressions + n_clicks)`"。
   跨 Day 23/24/25 的六份实现(用户 ×2 / AI ×2 / ref ×2 每日)**无一人写过**。
+- **第四级:守恒式断言有牙,而且它的上限可以说清楚**(Day 26 ref 实测/推导):上一条
+  "六份实现无一人写过"**在 Day 26 被打破**——P1 把守恒写进契约,三方都写了(用户在
+  入口数 raw,写对)。同一个漏查 bug 在三种路线下给出三类症状:**丢行**(拆分 +
+  union)-> 计数守恒抓到;**内部矛盾**(ACCEPTED 却 `qty_units` 为 NULL)-> 一致性
+  规则抓到;**一致地错分类**(合理的 reason、该 NULL 的都 NULL)-> **任何作业内断言
+  都抓不到**,只有与作业外的东西比对(期望数据、对账、人)。断言覆盖是一张映射:
+  **丢失 -> 守恒;自相矛盾 -> 一致性;看似合理的错分类 -> 作业外。**
+  两条配套:**分母在入口处数**——在 filter / inner join 之后数的分母是 Day 25
+  "`assert df is not None`"高一层的同一种病,检查在跑、但不可能失败;**只查
+  `n_out == n_in` 不够**,必须同时 `n_ids == n_in`,否则"丢一条 + 复制一条"互相抵消。
 
 ## 窗口 shuffle 机制(属于 spec,不属于函数)
 - shuffle 属于 window **SPEC**,不属于函数:row_number / rank / lag /
@@ -1055,6 +1065,15 @@
   **AQE 最终态未观测**——运行时很可能同样转成 BroadcastHashJoin。所以 hint 的价值
   是**把行为钉进计划、不依赖统计信息可用**,不能据此说 AI 跑得更快。
   与 Day 16"性能结论必须声明它成立的条件"同源。
+  **(Day 26 实测补完上面那条限定):**"AQE 最终态未观测、运行时很可能同样转成 BHJ"
+  **前半句已观测,后半句只对一半**。AI-DSL 无 hint,初始计划 6 个 Exchange + 3 SMJ;
+  执行后 `isFinalPlan=true`,**三个 join 全被 AQE 转成 BroadcastHashJoin,但仍剩 4 个
+  shuffle Exchange**——raw 按 join 键 shuffle 一次,每张维表**先 shuffle、再广播**各一次。
+  AQE 只能在 shuffle stage 跑完、拿到真实大小之后才转换,已付的 shuffle 收不回来。
+  同一作业有 hint 的 user-DSL 是 **0** 个。根因实测:`Scan ExistingRDD` 的
+  `sizeInBytes = 9223372036854775807`。所以"hint 的价值是保证、不是提速"要加条件:
+  **统计信息可用时成立;统计信息缺失时(本 harness、RDD、checkpoint、无统计的视图),
+  hint 实打实省下每张维表一次 shuffle 再加事实侧一次。**
 
 ## API 风格约定
 - 纯列引用(select/groupBy/on)-> 用普通字符串;当列参与表达式(比较、算术、
@@ -1177,6 +1196,11 @@
 - 哨兵字面量必须**只写一次**(抽成 CTE / 变量):`COALESCE(v,'BASE')` 和
   `COALESCE(v,'UNKNOWN')` 看着像同一件事,但对 Catalyst 是**不同的表达式**,
   分区不复用、join 也匹配不上。
+- **撞车点可以由作业自己的清洗步骤制造**(Day 26):作业带 `upper(trim(x))` 规范化时,
+  纯空格脏值 `'  '` 经 `trim` 变成 `''`;如果选了最顺手的 `''` 当哨兵,这条垃圾请求
+  会**静默匹配到"单包装"那一行**。`<=>` 不撞车:Catalyst 的 lowering 同样拿 `''` 填,
+  但配了一位 `isnull` 标志——**填充值 + 标志位才是不撞车的哨兵形态**。审查补问一句:
+  **哨兵值会不会在本作业的清洗之后出现?**
 
 ## null-safe join 的物理形态 (Day 16 实测, Spark 4.1.1)
 - `a <=> b` **不是**一个特殊的 join 算子。Catalyst 把它 desugar 成**两个普通
@@ -1671,6 +1695,13 @@
   比没有闸门更危险,因为 review 时会被当成已覆盖。
   (顺带:`if df:` 这种写法会直接抛 `CANNOT_CONVERT_COLUMN_INTO_BOOL` 从而暴露自己,
   `is not None` 恰恰是**不会报错**的那个写法,所以它能活到生产。)
+  **【已修正,Day 26 实测】上面括号里的说法是错的。**`CANNOT_CONVERT_COLUMN_INTO_BOOL`
+  只由 **`Column.__bool__`** 抛出;**`DataFrame` 既没定义 `__bool__` 也没定义 `__len__`**
+  (实测 `"__bool__" in vars(DataFrame) == False`),于是 Python 默认真值为 True:
+  `bool(spark.range(0)) == True`,空 DataFrame 也一样。`if df:`、裸 `assert df`、
+  `is not None` **三种写法同样恒真、同样静默**。Day 26 用户恰好写了 `assert unique_req`
+  (裸形式),连续第二天。判据统一为:**闸门里的被比较对象必须是 Python 标量**
+  (`.count()` / `.first()[...]` / `.isEmpty()` 之后的值)。
 - **时区/日历作业:先把"提到日期的地方"列全,再逐个问它读的是哪一列**(Day 25):
   一个作业里出现时区换算时,**不要问"换算做了吗"**——grain 列逼着它做,所以一定做了,
   而且它会在输出里显眼地正确。要问:**契约假定的那口钟,在每一个提到日期的地方
@@ -1698,3 +1729,33 @@
   日子,收尾时打一次 `df.schema.simpleString()` 和契约逐列对**,一次列扫描的事;
   按位置比较的 `check()` 对类型、按值比较的 `check()` 对顺序,**两者都不对类型**。
   与既有的"输出列顺序是静默契约变更"那条并列:那条管顺序,这条管类型。
+  **(Day 26,连续第四天,方向反了):**契约这次要 `int`,用户 DSL 对,SQL 写
+  `cast(... as bigint)`。前三天是"契约 bigint 写成 int",这天是"契约 int 写成
+  bigint"——所以问题**不是**对某个类型的偏好,是**收尾时缺对 schema 的检查**;
+  上面那个 `schema.simpleString()` 落地动作仍未执行过。
+- **一致性断言写好后,把派生定义代回去,逐子句问"按构造它可能为真吗?"**
+  (Day 26 实测):`load_status` 由 `reject_reason IS NULL` 推出时,在
+  `load_status = 'ACCEPTED'` 的过滤下 `reject_reason IS NOT NULL` **恒假**;把它用
+  **AND** 接在"`dc_code` 或 `qty_units` 为 NULL"后面,整条断言恒为 0。Day 26 用户两版
+  P2 正是如此:语法完整、提交 job、计数 0,**永远不会触发**——实测 ACCEPTED 且
+  `qty_units = NULL` 的行被正常发布。三条判据:(1) 违规条件**一律用 OR 列出**(每种
+  违规形态单独足以判错);(2) 与过滤谓词互为定义的子句是死子句,删掉它不改变任何
+  结果,只制造"已检查"的错觉;(3) **写完断言,手工喂一条违规行看它触不触发**——
+  没触发过的闸门不算写完。与上面"DataFrame 真值断言"同族:那条是求值缺失,这条
+  是谓词恒假,结局都是一道不存在的闸门。
+- **看到"先把两张参照表 join 成一张宽表、再查一次",问:后面的 `X IS NULL` 判定
+  读的是不是拥有 X 的那张表?**(Day 26):`sku_master ⋈ sku_pack` 后再按
+  `(sku, pack_code)` 查,得到的 `master_sku IS NULL` 意思是"**这个组合**不存在",
+  不是"**这个 SKU** 不存在"。上游保证成立时两者重合;保证失效时把"包装不对"误报成
+  `UNKNOWN_SKU`——这一行**一致地错**(reason 合理、该 NULL 的都 NULL),P1/P2 全绿
+  (Day 26 ref 的 Route Y′)。规则:**每个 lookup 只回答一个事实,每个路由判定只读
+  拥有那个事实的表。**与 Day 16"没有匹配 vs 匹配了但没有可用值"同族:那条区分
+  "查没查到"与"查到了没值",这条区分"**谁**没查到"。
+- **断言验证的是哪一次计算?**(Day 26):DataFrame 是惰性的,断言里每个 `.count()`
+  都从源头**重算**一遍,返回给调用方的 DataFrame 在写出时**再算一遍**。在
+  append-only landing 表上两次读之间可以有新行到达,于是**被断言的那份和被发布的
+  那份不是同一份**。Day 26 的 AI 用 `localCheckpoint(eager=True)` 同时钉住输入与
+  输出,`raw_count` / 断言 / 返回值同一快照;用户与 ref(`cache()` + 单独的
+  `raw.count()`)都没完全钉住。严重度 **production robustness**(首跑正确、源头在动时
+  才错)。注意 `localCheckpoint` 存在 executor 上、丢 executor 即丢数据,生产上权衡
+  `checkpoint()` 或先落地再断言。
