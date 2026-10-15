@@ -41,6 +41,7 @@
 | 24 | L2 detail modeling | logistics — cold-chain warehouse telemetry | Medium-Hard (4 stages) | `fct_device_hour` | P1. Every reading is attributed to the hour of its own `reading_ts`. `ingest_ts` records when the collector received the message and must never determine which hour a reading falls in.<br>P2. Before returning, the job must assert its own output: exactly one row per (device_id, reading_hour), and no NULL in `device_id` / `reading_hour` / `site_id`. A silent bad publish is worse than a failed job.<br>P3. Read only the columns this job needs from the two config tables. `model` and `ticket_id` are operational metadata and must not enter the pipeline. | **重传是一次新的传输**是全题靶心:landing 表 at-least-once,网关在**传输时刻**盖 `event_id`、collector 在**落库时刻**盖 `ingest_ts`,于是 E07 是 E02 的重发却带着全新的信封。能存活重传的身份只有载荷的业务键 `(device_id, reading_ts)`;按 `event_id` 或按整行去重都收不拢,且**必须收在入口**。失败形状是全项目最窄的一次:**整个输出只有一个整数格移动**(D1/09:00 的 `n_readings` 3 而非 2)。grain 由最后的 `groupBy` 构造性保证唯一、无 NULL、`avg` 与 `max` **双双不变**(D1 两条幸存读数都是 22.0,`mean{22,22} = mean{22,22,22}`)——AVG 只在被复制的值偏离组均值时才敏感,这份数据恰好不偏离。3 是一个合理的小时读数数量,输出里**没有任何形状信号**。诱饵是 E06/E06 的逐字节重复对:它被**每一条**去重路线抓到,包括两条错的,于是"重复已处理"这个错觉拿到了可见证据。读时 tell 两条,都只需一次列扫描:(1) 扫 `(device_id, reading_ts)` 找重复,E02/E07 在它上面撞车而信封每一列都不同;(2) E07 是全表**唯一** `ingest_ts` 落在比 `reading_ts` 更晚一个小时的行(09:20 测、10:18 到,58 分钟 vs 其余行 13-17 分钟),P1 正好把读者指向这对列。**AI 未踩陷阱但键选错了一档**:`select(device_id, reading_ts, temp_c).distinct()` 先投影掉信封再整行去重,同时收掉 E06 与 E07——但键里含**度量列**,比 ref Route B 还弱一档:Route B 在同键冲突时任意留一行,AI 的写法**两行都留**,一条订正重发(同 device 同 ts、`temp_c` 已修正)会整个漏过去,`n_readings = 2` 且 `avg` 是两者均值。**用户靠跑抓到 trap,非靠读**(Stage 1 首次 FAIL 报 3/2 后反推),连续第二天重演 Day 23 的同一形状。**用户 Stage 1 的真实缺陷是确定性而非正确性**:`row_number() OVER (PARTITION BY device_id, reading_ts ORDER BY reading_ts ASC)`——**`ORDER BY` 排的就是 partition key**,分区内恒定、全行平局,于是写出了 Route A 的语法、拿到的是 Route B 的保证(任意幸存者 + 重跑不幂等),而 ref 明写 Route A 是三种去重强度里"唯一能说明哪一份副本获胜"的那种。**P2 用户只做了一半**(有 NULL 断言、无 grain 唯一性断言,自己在 notes 里承认);AI 两条齐全。但 ref 实测给了更狠的判断:**完整的 P2 也看不见入口重复**——最后的 `groupBy` 让 grain 构造性唯一,唯一性断言在结构上不可能观察到已被折叠的重复,naive 路线三条断言全过。两侧暴露面**镜像**:用户 registry join 在聚合**后**,registry 若出现同 device 两行 -> 扇出 -> **grain 破坏** -> 恰好缺的就是那条断言;AI join 在聚合**前**,同样输入 -> `n_readings` 翻倍 -> grain 仍唯一、断言全绿。**P3 用户 DSL 违反、SQL 满足**(SQL 的 `fill_null_decommissioned_on` CTE 显式选四列,DSL 全表进 join),同一作业两个分支两种卫生标准;AI 两侧均满足。**但 P3 的症状实测为零**(见 log/04 列裁剪一条),归类应为 production robustness(两分支不一致),不是 performance。用户另有 `n_readings` **`cast('int')` 而契约要 bigint**——与 Day 23 完全相同的偏离,`check()` 比 Python int 故永远绿,**连续第二天**。**用户 REVIEW_NOTES 六行没有一行提到去重步骤**——刚被这一步烧过、AI 在同一步用了不同的键,这是当天最该被审的一级;Correctness 栏的实质观察("AI 聚合后 inner join registry 会不会扇出")方向正确但没走完,答案是 registry 被**声明**为一行一设备、而**没有任何代码强制这个声明**,那正是他自己跳过的断言的职责。Production 栏"site_id 作为 join key 不符合 P2"**两处皆错**:`site_id` 是 `groupBy` 里的函数依赖列不是 join 键,且与 P2(断言约束)无关;同栏"I bypass row count reconciliation"是准确自评。ANSI 栏**结论对理由错**(答"因为 inner join 不产 NULL",正确理由是"全程 string↔string、无 cast/除法/下标",ref 标准答案"无可标记项")。VERDICT PASS 结论对,理由"logic same as mine, differ at groupby step"**绕过了唯一要紧的那一级**——分歧在入口去重,不在 groupBy。PLAN(实测,AQE off,shuffle.partitions=4):**用户 DSL 4 / 用户 SQL 3 / AI DSL 4 / AI SQL 3** Exchange。`left_anti` 与 `NOT EXISTS` 的 Exchange 差在**两份独立编写的实现上同时复现**,SQL 侧把 feed 按 `device_id` **单键** shuffle 一次同时喂窗口与 join(`HashPartitioning(device_id)` 满足 `Window` 的 `ClusteredDistribution(device_id, reading_ts)`)——**分区键子集规则第六次确认**(Day 16/17/18/23)。AI DSL 的节点数与 ref Route B DSL **完全吻合**(Exch 4 / Sort 3 / Window 0 / HashAgg 4 / SMJ 2),`distinct` 与 `dropDuplicates` 同样计划成 partial+final 聚合;用户 DSL 是 4/6/1/2/2。用户与 AI 的真实差别**不是 shuffle 数**(都是 4),是 `Window` + `Sort` 换两个 `HashAggregate`。AI 的 `distinct` shuffle 键**宽一列**(`device_id, reading_ts, temp_c`),是"把 `temp_c` 放进去重键"这个设计选择的物理回声 |
 | 25 | L3 serving (aggregation) | ad delivery | Medium-Hard (5 stages) | `agg_campaign_market_daily` | P1. Re-running this job on the same four inputs must produce byte-identical output. The batch is replayed whenever the scheduler retries.<br>P2. Before returning, the job must assert its own output: exactly one row per (campaign_id, market_code, local_date), and no NULL in `campaign_id` / `market_code` / `local_date`. A silent bad publish is worse than a failed job.<br>P3. Read only the columns this job needs from the two config tables. `channel` and `reporting_currency` are operational metadata and must not enter the pipeline. | **时区换算有两个客户,只有一个是响的**是全题靶心:`local_date` 与 flight 窗口同在 market 本地钟上,`event_ts_utc` 在另一口钟上。grain 列**逼着**换算(不换算发不出 `local_date`),stage 3 的 scope 谓词**不逼任何事**,写成 `to_date(event_ts_utc)` 或裸串比较即静默换钟。失败形状是全项目第二窄:**整个输出只有两个格移动**(`(C1,JP,2026-09-10)` 读作 `1 / 8.0` 而非 `2 / 20.0`),行数仍 5、grain 仍唯一、无 NULL、同一行 `n_clicks` 仍对,"1 次曝光 $8" 是完全合理的投放日。设计好的不对称:**过度包含会多出一行被行数抓到,于是那个变体被刻意从数据里拿掉**,唯一存活的症状是"数字变小"。诱饵是 E07(DE 22:30Z→本地 09-11)与 E08(JP 20:00Z→本地 09-11):这两行**确实**跨本地午夜、`local_date` 在输出里**显眼地正确**,给出"时区换算是好的"的可见证据,而它们在两口钟下都落在 flight 内**从未处于风险中**。唯一暴露行是 **E01**(09-09 15:30Z → Tokyo 09-10 00:30),全表唯一"UTC 日期 ≠ 本地日期**且** flight 边界正好夹在两者之间"的行。读时 tell **不需要扫数据巧合**,就在题面点明是两口钟的两列上:A2 说 `local_date` 只由 `event_ts_utc` + `tz_name` 决定,`campaign_flight` 注释说两个 flight 日期在 market 本地钟上,A3 把两者相比——审查问题只有一句:**scope 谓词读的是哪一列?** 裸串变体另有独立毒性:`'2026-09-10 10:00:00' <= '2026-09-10'` 字典序为 **false**(短串更小),它还会静默删掉每个 flight 末日的全部事件,本数据没暴露纯属**运气**。**用户与 AI 双双未踩**——两边 stage 3 都过滤 `local_date`,三方五个阶段唯一分歧不在 trap 阶段。**但用户是写对、不是审出来**:Correctness 栏写的是"我和 AI 逻辑几乎一样",用同构性替代对照契约,一旦双方一起读 `event_ts_utc` 会一起 PASS 掉错解;**连续第四天 REVIEW 未锚在管线阶段上**(22 未触及 trap 轴 / 23 四条裸 LGTM / 24 六行不提去重)。**用户最实质的自身缺陷是 P2 空转**:两版都写 `exactly_once_cnt = agg.groupBy(...).filter(dup_cnt > 1)` 然后 `assert (exactly_once_cnt is not None)`——断言的是一个 DataFrame 对象,**恒为真、连一个 job 都不提交**,而用户在 notes 里判"quality assertions are correct here"。声称存在却不存在的闸门比没有闸门更危险。但 ref 实测给了更狠的判断:**即使写对也抓不到今天的 trap**——grain 由 `groupBy` 键构造性唯一、三键来自 join 不可能为 NULL,错解下两条断言**全绿**,**连续第三天**(23/24/25)作业自己的质量闸门放行错数字;通用规则升级为**断言只能观察活着进入输出的东西,永远看不见半路被丢掉的东西**。P1 两侧均满足,幂等由"**没有引入**不确定性"给出而非某行代码做到(无 `row_number` 撞平局、无无序 `first`/`last`),**只能靠读评分**;用户答"not pretty sure"说明判定动作缺失(过 stage 列表找顺序敏感算子)。P3 用户两版均违反、AI 两版均满足(`pm`/`mc`/`fl` 三个投影),用户自己抓到——但**症状实测为零**,`.explain()` 显示 Catalyst 已在 Scan 之上剪掉 `channel`/`reporting_currency`(`Project [placement_id, market_code]` / `Project [market_code, tz_name]`),归 production robustness 不归 performance(Day 24 同款)。**三方逐阶段:1/2/3/4 语义一致,分歧全在 stage 4–5。** stage 1 用户 `left` vs AI/ref `inner`:**测试数据不可区分**(孤儿 placement 在用户路线下 NULL market → 匹配不上 flight → 被 filter 丢,落点相同,但用户的 NULL 断言因此永远看不到它);stage 2 AI 多一层 `to_timestamp(col, fmt)` 而 ref 直接喂字符串——**纯装饰性**,用户判"冗余"应重归 cosmetic(它把假定的输入格式写进代码,ANSI 下脏格式两者同样抛);stage 4 **真实语义分叉**:用户/ref 用 `count(when(...))`、AI 用 `sum(when(...).otherwise(0))`——`count` 数非 NULL 空组给 **0**,`sum` 空组给 **NULL**,AI 的 `otherwise` **不是冗余防御而是它选 `sum` 之后的必要条件**(去掉即在 `n_impressions=0`/`n_clicks=0` 那两行返 NULL 直接 FAIL),而期望输出里那两行正是为打这一点而设;三方的 `spend_usd` COALESCE(用户 `sum(coalesce(x,0))` / AI `coalesce(sum(x),0.0)` / ref 裸 `sum`)在**任何**输入下等价,前两者均为冗余防御代码。stage 5 用户 **DSL `cast('int')` / SQL `CAST(... AS BIGINT)`**,契约要 bigint,`check()` 比 Python int 故永远绿——**连续第三天**(23/24/25)同款偏离,且今天更差一层:**同一指标在自己两条分支里是两种类型**,归 production robustness。另有 `.drop("campaign_flight.campaign_id", ...)` **静默无操作**(`drop` 不解析限定名),重复列一直留着,靠 `groupBy(df.campaign_id)` 显式指列避开歧义 = style,但属"读的人会以为已处理"那类;AI 侧 `result.cache()` 从不 `unpersist`,缓存生命周期泄漏到函数外 = style。PLAN(实测):**用户 DSL 6 个 shuffle Exchange / 3 SortMergeJoin / 0 BroadcastHashJoin**,**AI DSL 1 个 shuffle Exchange + 3 BroadcastExchange / 3 BroadcastHashJoin / 0 SMJ**——用户"AI 用 broadcast 更好"的主张**成立**,但真正的形状不是单调的 6 对 1:**用户的 partial/final `HashAggregate` 之间没有 Exchange**,因为 stage 3 的 SMJ 已按 `(campaign_id, market_code)` 分区、而它是 groupBy 键 `(campaign_id, market_code, local_date)` 的**子集**——**分区键子集规则第七次确认**(Day 16/17/18/23/24),AI 的广播路线反而必须为最终聚合付一次 shuffle。真实对比是 **"3 次 join shuffle + 0 次聚合 shuffle" vs "0 次 join shuffle + 1 次聚合 shuffle"**;且三张配置表远低于 `autoBroadcastJoinThreshold`,用户侧 `isFinalPlan=false` 未观测到 AQE 最终态,**broadcast hint 的价值是保证性而非提速**。ref 的 Route B(把窗口换算成 UTC 区间下推)本日**未实现**,其半开边界要点仅按概念记录 |
 | 26 | L1 staging / cleansing | inventory replenishment | Medium-Hard (4 stages) | `stg_replenishment_request` | P1. Every request in the landing batch must come out of the job exactly once — ACCEPTED or QUARANTINED, never dropped, never duplicated. Before returning, the job must assert it: count(ACCEPTED) + count(QUARANTINED) equals the row count of raw_replenishment_request, and `request_id` is unique in the output.<br>P2. Before returning, the job must also assert its routing is consistent: every ACCEPTED row has a non-NULL `dc_code` and `qty_units` and a NULL `reject_reason`; every QUARANTINED row has a non-NULL `reject_reason` and a NULL `dc_code` and `qty_units`. A silent bad publish is worse than a failed job.<br>P3. Read only the columns this job needs from the three reference tables. `store_name` and `buyer_id` are operational metadata and must not enter the pipeline. | **可空复合键上的假孤儿**是全题靶心:`units_per_case` 按 `(sku, pack_code)` 查,单包装 SKU 的 `pack_code` 在**两侧都是 NULL** 且表示同一件事("只有一种包装"),`NULL = NULL` 为 UNKNOWN,普通等值 join 永远查不到——R03(S03 / SKU-102 / NULL / 3 箱)门店已知、SKU 已知且 ACTIVE、它点名的 pack 行在 `sku_pack` 里存在,查找仍然落空。修法 `eqNullSafe` / `<=>` 或两侧同一个不撞车的哨兵。**R06 是诱饵**:另一条 NULL-pack 请求,已停售,契约在 QUARANTINED 行上本就把 `qty_units` 置 NULL,于是查找落空**不可见**,看起来作业已经扛过了 NULL pack。失败形状随路线变:**X 拆分 + union** -> R03 消失(7 行,P1 抓);**Y 左连接链 `=`** -> ACCEPTED / `qty_units = NULL`(P2 抓);**Y′ 从复合 pack join 推 UNKNOWN_SKU** -> 一致地误路由成 `UNKNOWN_SKU`,**P1/P2 全绿**,只有 `check()` 看得见。读时 tell 分散在题面三处(raw 注释、sku_pack 注释、上游保证),审查问题一句:**pack join 在两侧 NULL 时做什么?** **用户与 AI 双双未踩**(两边都 null-safe),且**用户的 REVIEW 首次靠读点中 trap**(Correctness 栏 "equalNullSafe is implemented on pack_code"),终止 22–25 连续四天的"REVIEW 未锚在 trap 阶段"。**但用户 stage 2 结构是 Y′ 形**:先 `sku_master ⋈ sku_pack` 再按 `(sku, pack <=>)` 查,`UNKNOWN_SKU` 读的是复合 join 的 `master_sku`——把 `<=>` 换成 `==` 就是那条唯一不被任何断言拦截的路线;扰动实测 `SKU-101/CS99`(超契约)下用户两版安静发布 `UNKNOWN_SKU`、AI/ref 因 P2 作业失败。**用户的两条质量闸门全部空转(实测)**:P1 唯一性 `assert unique_req`——对 DataFrame 做真值判断恒为真(`bool(spark.range(0)) == True`,`DataFrame` 无 `__bool__`/`__len__`),**Day 25 `is not None` 同款第二次**,重复 `request_id` 两版均正常返回;P2 写成 `(dc NULL \| qty NULL) & reason NOT NULL`(应为 OR),且 `load_status` 本由 `reject_reason` 推出,reason 子句在过滤谓词下**按构造恒假**,两个 filter 恒为 0——实测 ACCEPTED SKU 无任何 pack 行时两版**发布 `ACCEPTED / qty_units = NULL`**,即 P2 原文要防的 silent bad publish(AI 作业失败报 P2)。用户 P1 计数守恒写对(在入口数 raw),**守恒式断言首次被三方全部写出**(Day 23/24/25 六份实现无一人写过)。AI 另一亮点:`localCheckpoint(eager=True)` 钉住 raw 与 out,`raw_count` / 断言 / 返回值同一快照;用户断言跑在惰性重算上。**`qty_units` 用户 SQL `bigint` vs 契约 `int`**(DSL 对),**连续第四天**(23/24/25/26)类型偏离,且今天方向相反——不是 int 习惯,是**收尾没有对 schema**。REVIEW_NOTES:Performance 栏"不先合并 master 与 pack 会扇出"**两层皆错**(两表在所用键上各自唯一、无扇出;扇出是正确性类不是性能类),ANSI 栏把 `string→string` 的冗余 cast 归 ANSI(应为 style),Production 栏"我漏了 distinct id 检查"判错(写了但空转),且未看出自己 P2 空转。PLAN(实测 AQE 最终态,shuffle.partitions=4):**user-DSL 0 shuffle Exchange / 3 BHJ;user-SQL 4 / 3 BHJ;AI-DSL 初始 6 Exchange + 3 SMJ,最终 4 shuffle Exchange + 3 BroadcastExchange / 3 BHJ**——`Scan ExistingRDD` `sizeInBytes = Long.MaxValue` 静态不广播,AQE 运行时转 BHJ 但 shuffle 已付(raw 一次 + 每张维表各一次再广播)。用户 DSL 显式 hint 省 4 次 shuffle,SQL 分支没写,两分支卫生不一致。P3 三方均显式投影,无可测症状 |
+| 27 | L2 detail modeling | mobile app clickstream | Medium-Hard (5 stages) | `fct_app_session` | P1. Re-running this job on the same three inputs must produce byte-identical output. session_id is a pure function of the session's own events — never of run time, row order, or a generated sequence.<br>P2. Before returning, the job must assert its own output: session_id is unique; sum(n_events) equals the number of engagement events in raw_app_event; and session_id / device_id / platform / session_date are never NULL. A silent bad publish is worse than a failed job.<br>P3. Read only the columns this job needs from the two config tables. owner_team and push_token are operational metadata and must not enter the pipeline. | **日历午夜不是会话边界**是全题靶心:会话只由 `> 30 min` 间隔关闭,`session_date` 是会话的**属性**(取 `session_start_ts` 的日期),不是键的一部分。D1 23:48 -> 23:55 -> 00:09(间隔 7/14 分钟)是**一个**会话;任何把**事件级日期** `to_date(event_ts)` 放进 window `partitionBy`、rollup `groupBy` 或逐事件 session_id 的路线都把它切成两段(5 行 vs 4 行,`check()` 抓)。**D2 是诱饵**:23:20 -> 00:05 跨午夜但间隔 45 分钟,本就是两个会话,午夜切法在它上面**恰好正确**,给读者"午夜已处理"的可见证据。**P2 只在一种变体下有牙**(ref 实测):session_id 在 rollup 后由 `min(ts)` 铸造时,两段拿到不同 id,唯一性过、守恒过(2+1=3),**全绿照发**;逐事件先铸 id 再按日期分组时两段撞 id、唯一性触发(ref 推导,未执行)。**守恒抓丢失、唯一性抓重复,两者都抓不到错分段。** **用户与 AI 双双未踩**(两边 partition/groupBy 键都只有 device_id + 会话标签)。**AI 无 trap 呈现,VERDICT PASS 正确,但 Correctness 栏"correct, nothing wrong"未记录检查过键里有没有日期**。用户侧实测缺陷全在 stage 5:(B1)**空批次 runtime break**——`.first()` 返回 `None` 再取下标 `TypeError`,两分支;(B2)**唯一性闸门空转**——`groupBy(session_id).count().first()['uni_cnt'] == 1` 只看**任意一组**,实测 ids `['A','B','B']` -> 1 通过,Day 25/26 空转闸门的第三种形态;(B3)**守恒分母与输出共用扇出**——`event_catalog` 是手工配置、契约未声明 event_name 唯一,重复一行时 left join 扇出,`n_events` 翻倍,而守恒基线数的是同一个扇出后的 `true_events`,**实测静默发布 n_events=2**;ref 的 inner join 同病,**只有 AI 的 `distinct` + `left_semi` 免疫**;(B4)`n_events` `int` vs 契约 `bigint`,**连续第五天**类型偏离;(B5)SQL 分支最终 join 与守恒断言直接读整张 `device_registry` / `event_catalog`(P3 卫生,Catalyst 已剪列,无计划症状)。AI 侧:无 hint,AQE 最终态 **4 shuffle Exchange vs 用户 1**(Day 26 结论第二次实测);`to_timestamp`+`unix_timestamp` 依赖 session TZ = UTC,实测 LA 会话时区下跨 DST 回拨把 20 分钟间隔算成 80 分钟、切成两段(ref 同路线同病,harness 钉 UTC 测不到);用户 `timestamp_diff` 作用在字符串上取的是会话时区墙钟差,**意外正确**。AI 闸门用 `raise RuntimeError` 而非 `assert`,`python -O` 下仍生效;用户与 ref 的 `assert` 在 `-O` 下全部消失。REVIEW_NOTES:Performance 栏"no"与 VERDICT 理由"AI did not broadcast"自相矛盾(发现本身对、实测 4 vs 1,应归 Performance);Production 栏"LGTM"未逐条走 P1/P2/P3;Robustness 栏"我漏了 prev_ts NULL 过滤"**判错**(首行 `when(NULL > 30)` 落 `otherwise(0)`,标签从 0 起,分组不变,非 bug) |
 
 ## 调度矩阵(已用组合)
 
@@ -54,6 +55,7 @@
 | 24 | L2 detail modeling | logistics — cold-chain warehouse telemetry | replay |
 | 25 | L3 serving (aggregation) | ad delivery | timezone attribution |
 | 26 | L1 staging / cleansing | inventory replenishment | nullable key |
+| 27 | L2 detail modeling | mobile app clickstream | session boundary (boundary closure) |
 
 > **层级重叠标注(Day 25)**:Day 25 的层级与 **Day 23 同为 L3 serving**
 > (`refs/day25_*_ref.md` 头部写作 `L3 serving (aggregation)`),业务域与失败模式
@@ -66,6 +68,10 @@
 > **只被消耗了一半**——"孤儿该丢弃还是隔离"的契约问题已借 ACCEPTED/QUARANTINED
 > 分流实操;**真孤儿**(键确实不存在)与 `NOT IN` 三值逻辑未被打到,ref 只作为
 > Route X 的兄弟形态记录、未实测。至此 L1/L2/L4 各用一次、L3 两次。
+>
+> **层级重叠标注(Day 27)**:L2 第二次使用(Day 24 之后),业务域与失败模式两轴
+> 同时换新,按既有规则允许。至此 L1 ×1 / L2 ×2 / L3 ×2 / L4 ×1;**L4 incremental
+> 与 L1 staging 是最少用的两层**。`orphan keys` 轴仍只消耗一半(见 Day 26 标注)。
 
 ## Supplemental drills completed
 - Pivot mini-drills x5 (script form, no class): explicit values list,
@@ -176,7 +182,22 @@
   业务域与失败模式已同时换,允许)——但注意 Day 23 的 ref 已把
   "effective-dated join 的孤儿是 fact-side key,`left_anti` 找不到同一批
   订单"写进概念要点,该轴的新鲜度已被部分消耗。
-### NEXT(Day 27)
+### DONE(Day 27)
+- Day 27 已完成:L2 detail modeling / mobile app clickstream / session boundary,
+  5 stages Medium-Hard。选型理由 (1)(3) 兑现:三轴与最近两天零重叠,Stage 1 未现学
+  API(Stage 1 唯一卡点是 `to_timestamp` 的 format 方向——解析 vs 格式化,已在
+  提示下自行修正)。理由 (2) 兑现:Day 13 的 lag + running sum 首次进入完整作业,
+  双方都没把日期放进键。
+- 上一日附加的设计要求"**至少一条 P# 在 naive 路线下能被真正触发**"**兑现**:
+  inner join 丢 D3 -> 守恒 6 ≠ 7 触发(ref)。但 ref 同时证明最常见的 trap 变体
+  在 P2 下**全绿**。
+- **"闸门写了但不生效"连续第三天**(25 `is not None` / 26 裸 `assert df` + 恒假
+  谓词 / 27 `.first()` 抽样一组 + 空批次崩溃)。Day 26 定下的自检动作"**故意喂一条
+  违规行看断言是否触发**"本日**仍未执行**——执行了 B2 当场暴露。
+- 类型偏离连续第五天(契约 `bigint`,用户 `int`)。
+
+(以下为 Day 27 的原计划,保留作决策记录)
+
 - **Day 27 — L2 detail modeling / mobile app clickstream / failure mode:
   session boundary(gap 阈值切会话 + 跨午夜会话的日期归属)。5 stages ->
   Medium-Hard。** 三条理由:(1) **业务域与失败模式全新**,L2 只在 Day 24 用过
@@ -186,6 +207,18 @@
   API**:`lag` / running sum / gap 阈值切分 / 区间闭合 / 事件日期归属全部练过。
 - 建议延续本日观察加一条设计要求:**至少一条 P# 断言在 naive 路线下能被真正
   触发**,用来检验 Day 25/26 连续两天的"闸门空转"是否已被修正。
+### NEXT(Day 28)
+- **Day 28 — L4 incremental / ride-hailing trips / failure mode: orphan keys
+  (late-arriving dimension:事实先于维度行到达;真孤儿 + `NOT IN` 三值逻辑)。
+  5 stages -> Medium-Hard。** 三条理由:(1) **L4 是最少用的层**(仅 Day 22),
+  业务域全新;(2) **`orphan keys` 轴 Day 26 只消耗了一半**——"假孤儿"(比较失败)
+  已打,**真孤儿**(键此刻确实不存在、下一批才到)与 `NOT IN` 遇 NULL 整体塌空
+  从未实测;"晚到维度该丢弃、挂 UNKNOWN 占位还是隔离待重放"是增量作业的标准生产
+  问题,天然落在 L4;(3) **白名单内、零现学 API**:`left_anti` / `NOT IN` /
+  `<=>` / `broadcast` / upsert 全部练过(Day 9、16、22、26)。
+- 延续两条设计要求:**至少一条 P# 在 naive 路线下能被真正触发**;并把
+  "**作业必须在空 landing 批次上成功返回 0 行**"写成公开 P#——Day 27 B1 证明
+  空批次是真实的 runtime break 面,且它是契约问题、不是 trap,公开写出不泄题。
 
 - Later candidates (pre-switch list, kept for reference): MERGE INTO /
   Delta-style upsert against an existing dim table — **CLOSED by Day 22**;
@@ -251,6 +284,10 @@ Easy/Medium/Medium-Hard 的交替节奏。
   需要 `to_utc_timestamp(end_date + 1 day)` 配严格 `<`,**闭区间的本地 `<=` 末端
   没有闭区间的 UTC 等价物**。该下推路线(ref Route B)**本日未实现**,只按概念
   记录,`to_utc_timestamp` 的实操仍 OPEN。DST-crossing 变体仍 OPEN
+  <- **Day 27 DONE(L2 复用 Day 13 会话化)**:新增"**日期是会话的属性,不是键**"
+  (跨午夜短间隔会话)。DST 变体**部分关闭(实测,非题目)**:`timestampdiff`
+  取会话时区**墙钟差**,`unix_timestamp` 相减取**真实流逝**——两者在 DST 跳变日
+  相差 1h,方向随回拨/前拨相反。`session_window` 内置仍为黑名单
 - Null semantics special: null-safe equality (<=>), null in joins,
   null ordering in windows   <- Day 16 DONE (Stage 1 + digest; AI review 未做,已结)
   <- **Day 26 DONE(staging 层复用)**:可空复合查找键 `(sku, pack_code)`,NULL 在
@@ -289,6 +326,10 @@ Easy/Medium/Medium-Hard 的交替节奏。
   <- **Day 26 无实操**:用户与 AI 都走左连接链 + CASE;ref 把"拆分 + `left_anti`
   隔离 + union"记为 Route X(漏查行直接消失,P1 抓),并点名 `NOT IN` 为产生同样
   "行消失"形状的兄弟算子,均**未实测**
+  <- **Day 27 AI 实操 `left_semi` 做配置过滤**:`distinct` + `left_semi` 使
+  "手工配置表出现重复 event_name"时**不扇出**(实测 n_events 正确),用户
+  left join + filter 与 ref inner join 均翻倍。semi join 作为"**存在性过滤不受右表
+  重数影响**"的防扇出工具,Day 9 的 idiom 在配置表上第一次承重
 
 ## Difficulty cadence
 Alternate roughly Easy/Medium -> Medium -> Medium-Hard; insert an Easy

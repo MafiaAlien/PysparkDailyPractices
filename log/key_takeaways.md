@@ -119,6 +119,13 @@
   两条配套:**分母在入口处数**——在 filter / inner join 之后数的分母是 Day 25
   "`assert df is not None`"高一层的同一种病,检查在跑、但不可能失败;**只查
   `n_out == n_in` 不够**,必须同时 `n_ids == n_in`,否则"丢一条 + 复制一条"互相抵消。
+  **(Day 27 实测补充)"在入口处数"还不够——分母不能和输出共用一个可能扇出的
+  join。**用户的守恒基线数的是 `raw ⋈ catalog` 过滤后的 `true_events`,输出也从
+  它而来;`event_catalog` 一旦有重复 event_name,两边**同步翻倍**,断言恒等、
+  静默发布 `n_events = 2`。AI 的 `distinct` + `left_semi`(存在性过滤不受右表
+  重数影响)免疫;ref 的 inner join 同病。判据:**分母要么数 raw 本身再按
+  semi 过滤,要么在一个已证明唯一的键上 join**——基线和输出共享的每一个算子,
+  都是断言看不见的地方。
 
 ## 窗口 shuffle 机制(属于 spec,不属于函数)
 - shuffle 属于 window **SPEC**,不属于函数:row_number / rank / lag /
@@ -454,6 +461,15 @@
   你已经用 from_utc_timestamp 本地化过了;如果 session tz 非 UTC,to_date 会
   **第二次**平移 = 双重转换的日期漂移。把 session tz 钉死(harness 里用 UTC),
   让你算出来的日期不被静默地重新分桶。
+- **`timestampdiff` 与 `unix_timestamp` 相减不是同一个"差"**(Day 27 实测,
+  session TZ = America/Los_Angeles):`timestampdiff` 取的是**会话时区下的墙钟差**,
+  `unix_timestamp(b) - unix_timestamp(a)` 是**真实流逝秒数**。
+  回拨日 `01:50 -> 02:10`:`timestampdiff = 1200`,epoch 差 `= 4800`;
+  前拨日 `01:50 -> 03:10`:`timestampdiff = 4800`,epoch 差 `= 1200`。
+  后果:**UTC 字符串在非 UTC 会话里被当成本地时间解析**时,epoch 路线在 DST 日
+  差一小时(Day 27 实测 20 分钟间隔被算成 80 分钟、会话被切开);`timestampdiff`
+  恰好给出对的 UTC 差——但那是**墙钟语义的巧合**,不是设计。两条路线都依赖
+  `spark.sql.session.timeZone`;正解仍是**钉死 UTC**,别依赖哪条函数"碰巧免疫"。
 - 窗口过滤必须作用在**本地日期**上、在时区转换**之后**——绝不能用原始 UTC 日期。
   一个 UTC 上看在窗口外的时间戳,本地看可能在窗口内(反之亦然),所以先按 ts_utc
   过滤会丢错/留错行。这是时区陷阱的**第二层**,和方向 bug 是两回事:函数对了,
@@ -522,6 +538,18 @@
   而且每个 end 都平移了 +gap。**内置函数自带它自己的契约**——在伸手去用之前,
   先把它和写下来的规格对齐(当规格本身就是用 session_window 的语言写的时候
   它才是对的工具,尤其是流式场景)。
+- **日期是会话的属性,不是会话的键**(Day 27):会话边界只来自 gap 规则。任何
+  `to_date(event_ts)` 出现在 window `partitionBy` 或 rollup `groupBy` 里,都等于
+  偷偷加了第二个关闭条件"跨午夜即断"。通用形态:**由实体派生的属性(开始日期、
+  开始时间、id)从实体的聚合(`min(ts)`)算出,永远不从成员行算出。**
+  "每个输出维度都进 groupBy"这个本能**只在维度对分组键函数依赖时安全**——
+  `session_date` 依赖会话,`to_date(event_ts)` 不依赖。
+  **跨午夜且结果正确的样例不是证据**:Day 27 的 D2(间隔 45 分钟)被 gap 和午夜
+  同时切开,两种切法在它上面重合;唯一能区分的是**短间隔跨午夜**的会话(D1)。
+  断言的覆盖面(ref 实测 + 推导):session_id 在 rollup 后铸造时,切开的两段拿到
+  不同 id,**唯一性与守恒双双全绿**;逐事件先铸 id 时两段撞 id,唯一性才触发。
+  **守恒抓丢失、唯一性抓重复,两者都抓不到错分段。**
+  审查问题一句:**window 的分区键和 groupBy 键里,除了实体键和会话标签还有别的吗?**
 
 ## SCD2 / 区间闭合 (Day 17)
 - **一个版本是一段 run,不是一行**。SCD2 本质就是换了谓词的 gaps-and-islands:
@@ -1733,6 +1761,8 @@
   `cast(... as bigint)`。前三天是"契约 bigint 写成 int",这天是"契约 int 写成
   bigint"——所以问题**不是**对某个类型的偏好,是**收尾时缺对 schema 的检查**;
   上面那个 `schema.simpleString()` 落地动作仍未执行过。
+  **(Day 27,连续第五天):**契约 `bigint`,用户两分支 `cast('int')`,AI 两分支
+  `bigint`。仍未执行收尾 schema 对照。
 - **一致性断言写好后,把派生定义代回去,逐子句问"按构造它可能为真吗?"**
   (Day 26 实测):`load_status` 由 `reject_reason IS NULL` 推出时,在
   `load_status = 'ACCEPTED'` 的过滤下 `reject_reason IS NOT NULL` **恒假**;把它用
@@ -1759,3 +1789,17 @@
   `raw.count()`)都没完全钉住。严重度 **production robustness**(首跑正确、源头在动时
   才错)。注意 `localCheckpoint` 存在 executor 上、丢 executor 即丢数据,生产上权衡
   `checkpoint()` 或先落地再断言。
+- **闸门对一个样本求值 = 没有闸门**(Day 27,空转闸门第三种形态):
+  `assert df.groupBy(k).count().first()["count"] == 1` 取到的是 Python 标量
+  (满足 Day 25/26 的判据),但它检查的是**任意一组**——实测 ids `['A','B','B']`
+  返回 1 通过。全表性质要求全表聚合:`count() == countDistinct(k)` 或
+  `filter(count > 1).isEmpty()`。同一个 `.first()[...]` 还有第二个坑:**空批次上
+  `first()` 返回 `None`**,取下标直接 `TypeError`(Day 27 两分支实测),`sum` 空表
+  返回 NULL 同理——用 `coalesce(sum, 0)` 并让统计聚合在零行上返回一行。第三:
+  **`assert` 在 `python -O` 下整条被剥离**(实测),生产闸门用显式 `raise`;Day 27
+  的 AI 这样写了,用户与 ref 都没有。审查触发点:**看到闸门里有 `.first()` /
+  `.collect()[0]`,问"零行时返回什么?它看的是全部还是一行?"**
+- **会话化 / 分段作业:先把所有 `partitionBy` 与 `groupBy` 的键列出来,问"除了
+  实体键和段标签,还有别的吗?"**(Day 27):多出来的任何列(尤其是日期)都是
+  一个未声明的分段条件。与 Day 25"时区作业先列全提到日期的地方"同构——**审查
+  按管线阶段去 log/04 取对应那条**,本条对应 sessionize 与 rollup 两个阶段。
