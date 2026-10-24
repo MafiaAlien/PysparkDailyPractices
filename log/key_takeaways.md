@@ -180,6 +180,13 @@
   (explode_outer 之后把空数组客户归零)。
 - CASE WHEN ... ELSE 0 vs 不写 ELSE + COALESCE:两种 NULL 策略都合法,
   但必须成对一致使用。
+- **`when(...).otherwise(0)` 是逐行的,救不了空集上的 `sum`**(Day 28 实测):
+  `df.filter(p).agg(sum(when(c,1).otherwise(0)))`——`otherwise` 只对 filter 留下来的
+  每一行起作用;filter 后一行不剩时 `sum` 拿到空集,返回 NULL。而 filter 制造空集
+  比想象中容易:"raw 为空、carried 只剩 PENDING"的正常夜晚,PUBLISHED 子集就是空的。
+  条件计数的稳健写法是**不先 filter、也不用 sum**:`count(when(p & c, 1))`——
+  `count` 在空集上返回 0,而且本来就不数 `when` 未命中时产生的 NULL。
+  `coalesce(sum(...), 0)`(Day 27 条里的写法)也能用,但它是在补一个本可以不出现的 NULL。
 
 ## Join
 - on="key"(字符串)把 join key 合并成**一列**;left join 时合并后的 key
@@ -202,6 +209,11 @@
 - 单块 GROUP BY 里用了变换过的 key:要么在 GROUP BY 里**原样重复**同一个
   表达式,要么把变换提到 CTE/子查询里(最干净——只有一份,不会漂移)。
   GROUP BY 写 alias 会**优先解析输入列**(静默改绑定)且不可移植。
+- **晚到维度的三种标准处理,选哪种是契约决定**(Day 22/27/28):事实先于维度行到达时,
+  作业只能 (a) 丢弃(静默丢失)、(b) 挂 `UNKNOWN` 占位成员发布(Day 27)、
+  (c) 暂存待重放(park-and-replay,Day 28)。(c) 让 `pending ∪ new` 成为作业的真实
+  输入,**守恒必须对这个并集来写**,不能对 landing 批次写;被暂存的行必须保留
+  `first_seen_date`,不能被每次重放刷新。
 
 ## Join 扇出(fan-out):在聚合之前发生的聚合 bug (Day 23 实测)
 - **join 不是查字典,是配对**:左表每一行与右表所有满足条件的行逐一配对,
@@ -262,6 +274,14 @@
 - 为什么 IN (subquery) 变成 semi 而不是 inner:IN 的含义是"至少出现一次"
   -> 既**不能**放大左侧行(一个客户匹配 3 条订单仍然只出 1 行),**也不能**
   发出右侧列。这两个约束**就是** semi join 的定义。
+- **拆分 + union 路线:两个分支必须按构造互为补集**(Day 28 ref 实测):
+  inner join 出 PUBLISHED、再对**维表** `left_anti` 出 PENDING,两个谓词不互补——
+  "司机在、fleet 查不到"的行两边都不在(8 -> 6)。互补只在二值逻辑下成立,
+  `IN`/`NOT IN` 遇 NULL、inner join 配另一张表上的 anti join,都会留下第三类行。
+  结构上安全的写法是**在非 NULL 主键上对已发布结果做 anti join**
+  (`resolved.join(published.select("trip_id"), "trip_id", "left_anti")`)。
+  代价也要知道:已发布子树在计划里出现 3 次,4 个 Exchange / 7 个 BroadcastExchange,
+  对比单路 CASE 的 0 / 2(实测)。**用一个 status 列代替两个 frame,通常更便宜也更安全。**
 
 ## NOT IN vs NOT EXISTS —— 三值逻辑陷阱
 - NOT IN + 子查询里**含任何 NULL** -> 整个查询返回**零行**:x <> NULL 是
@@ -281,6 +301,18 @@
   时,Catalyst 会插入 NULL-aware anti join -> 可能退化成
   BroadcastNestedLoopJoin / 额外的 null 检查谓词 = 更重的计划。
   isNotNull() 把 NOT IN 从重计划救回轻的 LeftAnti 计划。
+- **外层那一半的实测,而且外层 NULL 可以是作业自己制造的**(Day 28 ref 实测):上面
+  "两侧都无 NULL"一条此前只在子查询侧练过(Day 16)。Day 28 的 `fleet_id` 在输入里
+  只有一行 NULL(D5 未分配),但作业**自己的 `LEFT JOIN dim_driver`** 给每个查不到
+  司机的行(D9、D8)也补出了 NULL fleet_id,于是
+  `fleet_id NOT IN (SELECT fleet_id FROM fleet_commission)` 静默丢掉 3 行(8 -> 5),
+  而子查询侧完全干净。计划里能直接看到:
+  `BroadcastHashJoin [fleet_id], [fleet_id], LeftAnti, BuildRight, true`——
+  末尾的 `true` 是 `isNullAwareAntiJoin`;同一个计划里其余 join 都退化成 SMJ,
+  唯独它走了 broadcast,说明这来自 null-aware anti join 的规划路径,不是按大小
+  自动 broadcast(具体规则未定位)。**审查判据:`NOT IN` 外层列的上游有没有
+  outer join?** 有,就当它可空——不管输入的列声明怎么写。同族:Day 26 `trim`
+  自己制造了哨兵撞车。
 
 ## 冗余防御代码 —— join 版 (Day 9)
 - semi/anti 之前对**右侧** distinct() 是冗余的:存在性语义本来就忽略右侧的
@@ -1803,3 +1835,21 @@
   实体键和段标签,还有别的吗?"**(Day 27):多出来的任何列(尤其是日期)都是
   一个未声明的分段条件。与 Day 25"时区作业先列全提到日期的地方"同构——**审查
   按管线阶段去 log/04 取对应那条**,本条对应 sessionize 与 rollup 两个阶段。
+- **闸门的比较对象是 Python 标量还不够,要问它比的是"违规数 == 0"还是"有没有值"**
+  (Day 28,空转闸门第四种形态,连续第四天):
+  `assert bad_cnt is not None` 拿到的是标量(满足 Day 26 判据),但这是**存在性测试**——
+  违规数 3 也不是 None,闸门永远放行(实测静默发布 PUBLISHED / earning NULL);
+  而空集上 `sum` 恰好返回 None,同一条断言反过来在**合法的空夜晚**报错(实测 P3 崩溃)。
+  一条断言同时做到"该报的不报、不该报的报"。审查触发点:**看到闸门,把违规值代进去
+  ("如果有 1 条坏行,这个表达式等于什么?"),再把空输入代进去("零行时等于什么?")。**
+  两次代入都给出正确答案,才算写完。正确形态:一个全局 `agg`,
+  `count(when(bad, 1))`,`!= 0` 就 `raise`。
+- **状态与载荷由两个不同的谓词决定时,找一个让"状态为真、载荷为 NULL"的输入**
+  (Day 28,Day 26"每个 lookup 只回答一个事实"的延伸):查找链(fact → dim → config)里,
+  一个 key 可以在第一跳找到、在第二跳成为孤儿;门控必须测**载荷由之计算的那一列**,
+  不是第一跳的 key。Day 28 三方:ref `commission_pct IS NOT NULL` 同时驱动 `load_status`
+  和 earning(**一个谓词,两个消费者**);用户 `f.fleet_id IS NOT NULL`、AI
+  `d.driver_id AND c.fleet_id IS NOT NULL` 测的是 key——测试数据上全对,
+  `fleet_commission` 有一行 `('F9', NULL)` 时两者都判 PUBLISHED / earning NULL(实测)。
+  审查问题一句:**决定 status 的那一列,和计算载荷的那一列,是同一列吗?**
+  不是,P2 类一致性断言就是唯一的防线,它必须真的会触发(见上一条)。
